@@ -22,6 +22,9 @@ import logging
 import time
 from typing import Optional
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from config import (
     ASSETS, DAILY_LOSS_LIMIT, DRAWDOWN_CAP, CONSECUTIVE_LOSS_PAUSE,
     MIN_BET, STARTING_BANKROLL,

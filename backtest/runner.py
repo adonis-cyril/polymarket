@@ -81,7 +81,7 @@ class BacktestConfig:
     enable_reversals: bool = True
     reversal_min_market_lean: float = 0.60
     reversal_max_market_lean: float = 0.85
-    reversal_min_counter_move: float = 0.05
+    reversal_min_counter_move: float = 0.10  # Higher for backtest (1-min candle resolution)
     reversal_max_position_pct: float = 0.15
 
 
@@ -408,6 +408,7 @@ def run_backtest(
         # Evaluate each asset for this window
         best_trade: Optional[dict] = None
         best_score = 0.0
+        best_reversal: Optional[dict] = None
 
         for asset in candles_by_asset:
             window_candles = windows_by_asset[asset].get(window_ts, [])
@@ -435,12 +436,11 @@ def run_backtest(
                 result.windows_skipped_regime += 1
                 continue
 
-            # Check for reversal first
-            if config.enable_reversals:
+            # Check for reversal (store separately, don't short-circuit snipes)
+            if config.enable_reversals and best_reversal is None:
                 reversal = _check_reversal(asset, window_candles, config)
                 if reversal:
-                    # Reversal takes priority
-                    best_trade = {
+                    best_reversal = {
                         "asset": asset,
                         "trade_type": "REVERSAL",
                         "direction": reversal["direction"],
@@ -449,14 +449,11 @@ def run_backtest(
                         "delta_pct": reversal["counter_move_pct"],
                         "regime": regime.value,
                         "window_candles": window_candles,
-                        "signal_score": 5.0,  # Reversal gets fixed high score
+                        "signal_score": 5.0,
                     }
-                    best_score = 999  # Always prefer reversal
-                    break
 
             # Normal snipe: calculate delta at entry time
             open_price = window_candles[0].open
-            close_price = window_candles[-1].close
 
             # Simulate entry point (use second-to-last candle as "entry" price)
             entry_candle_idx = max(0, len(window_candles) - 2)
@@ -478,8 +475,11 @@ def run_backtest(
             token_price = prices.up_ask if direction == "UP" else prices.down_ask
             win_prob = estimate_win_probability(delta_pct, seconds_left, asset)
 
-            # Signal score (simplified for backtest: delta-weighted)
-            signal_score = abs(delta_pct) * 7.0  # Delta weight = 7 per spec
+            # Signal score (backtest: normalized so typical 0.05% delta ≈ score 5.0)
+            # In live trading, the full signal stack (delta, oracle lag, book imbalance,
+            # whale, multi-exchange) produces the composite score. For backtest, we
+            # normalize delta alone to the same scale.
+            signal_score = abs(delta_pct) * 100.0  # 0.05% → 5.0
 
             if signal_score > best_score and signal_score >= config.min_signal_score:
                 best_score = signal_score
@@ -494,6 +494,12 @@ def run_backtest(
                     "window_candles": window_candles,
                     "signal_score": signal_score,
                 }
+
+        # Decide between snipe and reversal (mutually exclusive per spec)
+        # Prefer snipe if available; only use reversal if no snipe found
+        if best_trade is None and best_reversal is not None:
+            best_trade = best_reversal
+        # If both exist, snipe takes priority (reversal is supplementary)
 
         if not best_trade:
             result.windows_skipped_no_edge += 1

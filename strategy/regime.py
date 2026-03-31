@@ -13,13 +13,15 @@ The regime determines:
 3. Signal confidence weighting
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
-from data.binance_ws import BinanceWebsocket, Candle
-from data.historical import HistoricalCandle
+if TYPE_CHECKING:
+    from data.binance_ws import BinanceWebsocket
 
 logger = logging.getLogger(__name__)
 

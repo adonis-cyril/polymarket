@@ -18,7 +18,7 @@ from config import ASSETS, BINANCE_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_KLINES_URL = "https://data-api.binance.vision/api/v3/klines"
 MAX_CANDLES_PER_REQUEST = 1000
 ONE_MINUTE_MS = 60 * 1000
 REQUEST_DELAY = 0.2  # seconds between paginated requests to avoid rate limits

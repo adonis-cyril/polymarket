@@ -227,7 +227,16 @@ class PolymarketWebsocket:
                         if not self._running:
                             break
                         try:
-                            self._handle_message(json.loads(raw_msg))
+                            parsed = json.loads(raw_msg)
+                            # Polymarket can send arrays of messages
+                            if isinstance(parsed, list):
+                                for item in parsed:
+                                    if isinstance(item, dict):
+                                        self._handle_message(item)
+                            elif isinstance(parsed, dict):
+                                self._handle_message(parsed)
+                        except json.JSONDecodeError:
+                            pass  # Ignore non-JSON messages (pings, etc.)
                         except Exception:
                             logger.exception("Error handling Polymarket WS message")
 

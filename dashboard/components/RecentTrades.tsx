@@ -106,14 +106,18 @@ export default function RecentTrades() {
                       <span className={`text-[10px] px-1 rounded ${
                         trade.exit_reason === "TAKE_PROFIT_10PCT" ? "bg-green-900/30 text-green-400" :
                         trade.exit_reason === "RESOLUTION_WIN" ? "bg-accent/20 text-accent" :
-                        trade.exit_reason === "TIME_STOP" ? "bg-yellow-900/30 text-yellow-400" :
+                        trade.exit_reason === "ACCEPTABLE_PROFIT" ? "bg-emerald-900/30 text-emerald-400" :
+                        trade.exit_reason === "EDGE_VANISHED_PROFIT" ? "bg-yellow-900/30 text-yellow-400" :
+                        trade.exit_reason === "BREAKEVEN_EXIT" ? "bg-gray-700/30 text-gray-400" :
                         trade.exit_reason === "STOP_LOSS" ? "bg-red-900/30 text-red-400" :
                         trade.exit_reason === "RESOLUTION_LOSS" ? "bg-red-900/30 text-red-400" :
                         "bg-card-border text-muted"
                       }`}>
                         {trade.exit_reason === "TAKE_PROFIT_10PCT" ? "10% TP" :
                          trade.exit_reason === "RESOLUTION_WIN" ? "RES W" :
-                         trade.exit_reason === "TIME_STOP" ? "TIME" :
+                         trade.exit_reason === "ACCEPTABLE_PROFIT" ? "7-9% TP" :
+                         trade.exit_reason === "EDGE_VANISHED_PROFIT" ? "EDGE" :
+                         trade.exit_reason === "BREAKEVEN_EXIT" ? "BE" :
                          trade.exit_reason === "STOP_LOSS" ? "SL" :
                          trade.exit_reason === "RESOLUTION_LOSS" ? "RES L" :
                          trade.exit_reason}
@@ -133,11 +137,16 @@ export default function RecentTrades() {
                 </td>
                 <td
                   className={`py-2 pr-3 text-right font-mono ${
-                    (trade.pnl ?? 0) >= 0 ? "text-win" : "text-loss"
+                    (trade.net_profit_after_fees ?? trade.pnl ?? 0) >= 0 ? "text-win" : "text-loss"
                   }`}
                 >
-                  {(trade.pnl ?? 0) >= 0 ? "+" : ""}$
-                  {Math.abs(trade.pnl ?? 0).toFixed(2)}
+                  {(trade.net_profit_after_fees ?? trade.pnl ?? 0) >= 0 ? "+" : ""}$
+                  {Math.abs(trade.net_profit_after_fees ?? trade.pnl ?? 0).toFixed(2)}
+                  {trade.fees_paid ? (
+                    <span className="text-muted text-[9px] block">
+                      -${trade.fees_paid.toFixed(2)} fee
+                    </span>
+                  ) : null}
                 </td>
                 <td className="py-2 text-right font-mono">
                   ${trade.balance_after.toFixed(2)}

@@ -7,14 +7,35 @@ import type { BotState, Trade } from "@/lib/types";
 interface Stats {
   winRate: string;
   totalTrades: number;
-  reversalCount: number;
   targetHitRate: string;
-  avgReturn: string;
+  avgNetReturn: string;
   avgHoldDuration: string;
   bestTrade: string;
-  reversalWinRate: string;
-  whaleAlignment: string;
+  exitBreakdown: Record<string, number>;
+  reentriesPerWindow: string;
+  currentFeeRate: string;
+  feesNormal: boolean;
 }
+
+const EXIT_LABELS: Record<string, string> = {
+  TAKE_PROFIT_10PCT: "10% TP",
+  RESOLUTION_WIN: "Res Win",
+  ACCEPTABLE_PROFIT: "7-9% TP",
+  EDGE_VANISHED_PROFIT: "Edge Exit",
+  BREAKEVEN_EXIT: "Breakeven",
+  STOP_LOSS: "Stop Loss",
+  RESOLUTION_LOSS: "Res Loss",
+};
+
+const EXIT_COLORS: Record<string, string> = {
+  TAKE_PROFIT_10PCT: "bg-green-500",
+  RESOLUTION_WIN: "bg-accent",
+  ACCEPTABLE_PROFIT: "bg-emerald-400",
+  EDGE_VANISHED_PROFIT: "bg-yellow-500",
+  BREAKEVEN_EXIT: "bg-gray-400",
+  STOP_LOSS: "bg-red-500",
+  RESOLUTION_LOSS: "bg-red-700",
+};
 
 export default function StatsGrid() {
   const [stats, setStats] = useState<Stats | null>(null);
@@ -23,73 +44,76 @@ export default function StatsGrid() {
     async function load() {
       const [{ data: state }, { data: trades }] = await Promise.all([
         supabase.from("bot_state").select("*").eq("id", 1).single(),
-        supabase
-          .from("trades")
-          .select("*")
-          .order("pnl", { ascending: false })
-          .limit(500),
+        supabase.from("trades").select("*").order("timestamp", { ascending: false }).limit(500),
       ]);
 
       if (!state || !trades) return;
 
       const s = state as BotState;
       const allTrades = trades as Trade[];
-      const reversals = allTrades.filter((t) => t.trade_type === "REVERSAL");
-      const reversalWins = reversals.filter((t) => t.result === "WIN");
-      const whaleAligned = allTrades.filter((t) => t.whale_aligned);
 
-      const best = allTrades[0];
-      const bestStr = best
-        ? `+$${(best.pnl ?? 0).toFixed(2)} (${best.asset.toUpperCase()})`
-        : "N/A";
-
-      // 10% target hit rate: trades where return_pct >= 10 OR exit_reason is TAKE_PROFIT_10PCT or RESOLUTION_WIN
+      // 10% target hit rate
       const targetHits = allTrades.filter(
         (t) =>
-          (t.return_pct !== null && t.return_pct >= 10) ||
           t.exit_reason === "TAKE_PROFIT_10PCT" ||
-          t.exit_reason === "RESOLUTION_WIN"
+          t.exit_reason === "RESOLUTION_WIN" ||
+          (t.return_pct !== null && t.return_pct >= 10)
       );
-      const targetHitRate =
-        allTrades.length > 0
-          ? `${((targetHits.length / allTrades.length) * 100).toFixed(1)}%`
-          : "N/A";
+      const targetHitRate = allTrades.length > 0
+        ? `${((targetHits.length / allTrades.length) * 100).toFixed(1)}%`
+        : "N/A";
 
-      // Average return per trade
-      const returnsWithData = allTrades.filter((t) => t.return_pct !== null);
-      const avgReturn =
-        returnsWithData.length > 0
-          ? `${(returnsWithData.reduce((s, t) => s + (t.return_pct ?? 0), 0) / returnsWithData.length).toFixed(1)}%`
-          : "N/A";
+      // Avg net return (after fees)
+      const withNet = allTrades.filter((t) => t.net_profit_after_fees !== null);
+      const avgNet = withNet.length > 0
+        ? withNet.reduce((s, t) => s + (t.net_profit_after_fees ?? 0), 0) / withNet.length
+        : 0;
+      // Express as % of bet
+      const withBet = allTrades.filter((t) => t.bet_size > 0 && t.net_profit_after_fees !== null);
+      const avgNetPct = withBet.length > 0
+        ? withBet.reduce((s, t) => s + ((t.net_profit_after_fees ?? 0) / t.bet_size) * 100, 0) / withBet.length
+        : 0;
 
-      // Average hold duration
-      const holdsWithData = allTrades.filter(
-        (t) => t.hold_duration_seconds !== null && t.hold_duration_seconds > 0
-      );
-      const avgHoldSecs =
-        holdsWithData.length > 0
-          ? holdsWithData.reduce((s, t) => s + (t.hold_duration_seconds ?? 0), 0) /
-            holdsWithData.length
-          : 0;
-      const avgHoldDuration =
-        avgHoldSecs > 0 ? `${Math.round(avgHoldSecs)}s` : "N/A";
+      // Avg hold duration
+      const withHold = allTrades.filter((t) => t.hold_duration_seconds !== null && t.hold_duration_seconds > 0);
+      const avgHoldSecs = withHold.length > 0
+        ? withHold.reduce((s, t) => s + (t.hold_duration_seconds ?? 0), 0) / withHold.length
+        : 0;
+
+      // Exit breakdown
+      const exitBreakdown: Record<string, number> = {};
+      for (const t of allTrades) {
+        const reason = t.exit_reason ?? "UNKNOWN";
+        exitBreakdown[reason] = (exitBreakdown[reason] ?? 0) + 1;
+      }
+
+      // Re-entries per window
+      const maxEntries = allTrades.reduce((m, t) => Math.max(m, t.num_entries_this_window ?? 1), 1);
+      const multiEntryWindows = allTrades.filter((t) => (t.num_entries_this_window ?? 1) > 1).length;
+
+      // Fee info
+      const latestFee = allTrades.find((t) => t.fee_rate !== null);
+      const feeRate = latestFee?.fee_rate ?? 0;
+      const roundTripPct = feeRate * 2 * 100;
+
+      // Best trade (by net profit)
+      const sorted = [...allTrades].sort((a, b) => (b.net_profit_after_fees ?? b.pnl ?? 0) - (a.net_profit_after_fees ?? a.pnl ?? 0));
+      const best = sorted[0];
+      const bestStr = best
+        ? `+$${(best.net_profit_after_fees ?? best.pnl ?? 0).toFixed(2)} (${best.asset.toUpperCase()})`
+        : "N/A";
 
       setStats({
         winRate: `${((s.win_rate ?? 0) * 100).toFixed(1)}%`,
         totalTrades: s.total_trades,
-        reversalCount: reversals.length,
         targetHitRate,
-        avgReturn,
-        avgHoldDuration,
+        avgNetReturn: avgNetPct !== 0 ? `${avgNetPct.toFixed(1)}%` : "N/A",
+        avgHoldDuration: avgHoldSecs > 0 ? `${Math.round(avgHoldSecs)}s` : "N/A",
         bestTrade: bestStr,
-        reversalWinRate:
-          reversals.length > 0
-            ? `${((reversalWins.length / reversals.length) * 100).toFixed(1)}%`
-            : "N/A",
-        whaleAlignment:
-          allTrades.length > 0
-            ? `${((whaleAligned.length / allTrades.length) * 100).toFixed(0)}%`
-            : "N/A",
+        exitBreakdown,
+        reentriesPerWindow: multiEntryWindows > 0 ? `${multiEntryWindows} multi-entry windows` : "None yet",
+        currentFeeRate: `${roundTripPct.toFixed(2)}% RT`,
+        feesNormal: roundTripPct <= 3,
       });
     }
 
@@ -97,31 +121,18 @@ export default function StatsGrid() {
 
     const channel = supabase
       .channel("stats_updates")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "bot_state" },
-        () => load()
-      )
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "trades" },
-        () => load()
-      )
+      .on("postgres_changes", { event: "*", schema: "public", table: "bot_state" }, () => load())
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "trades" }, () => load())
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
   if (!stats) {
     return (
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
         {Array.from({ length: 6 }).map((_, i) => (
-          <div
-            key={i}
-            className="bg-card-bg border border-card-border rounded-xl p-4 animate-pulse"
-          >
+          <div key={i} className="bg-card-bg border border-card-border rounded-xl p-4 animate-pulse">
             <div className="h-4 bg-card-border rounded w-20 mb-2" />
             <div className="h-8 bg-card-border rounded w-16" />
           </div>
@@ -130,47 +141,61 @@ export default function StatsGrid() {
     );
   }
 
-  const cards = [
-    { label: "Win Rate", value: stats.winRate, sub: `${stats.totalTrades} trades (${stats.reversalCount} reversals)` },
-    {
-      label: "10% Target Hit Rate",
-      value: stats.targetHitRate,
-      sub: "trades reaching 10%+ return",
-    },
-    {
-      label: "Avg Return / Trade",
-      value: stats.avgReturn,
-      sub: `avg hold: ${stats.avgHoldDuration}`,
-    },
-    { label: "Best Trade", value: stats.bestTrade, sub: "" },
-    {
-      label: "Reversals",
-      value: `${stats.reversalWinRate} win rate`,
-      sub: `${stats.reversalCount} reversal trades`,
-    },
-    {
-      label: "Whale Alignment",
-      value: stats.whaleAlignment,
-      sub: "trades with whale confirmation",
-    },
-  ];
+  const totalExits = Object.values(stats.exitBreakdown).reduce((s, n) => s + n, 0);
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
-      {cards.map((card) => (
-        <div
-          key={card.label}
-          className="bg-card-bg border border-card-border rounded-xl p-4"
-        >
-          <div className="text-xs text-muted uppercase tracking-wide mb-1">
-            {card.label}
+    <div className="space-y-4">
+      {/* Main stats */}
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+        {[
+          { label: "Win Rate", value: stats.winRate, sub: `${stats.totalTrades} total trades` },
+          { label: "10% Target Hit Rate", value: stats.targetHitRate, sub: "trades reaching 10%+ net" },
+          { label: "Avg Net Return", value: stats.avgNetReturn, sub: `avg hold: ${stats.avgHoldDuration}` },
+          { label: "Best Trade", value: stats.bestTrade, sub: "net profit after fees" },
+          { label: "Re-entries", value: stats.reentriesPerWindow, sub: "max 3 per window" },
+          {
+            label: "Fee Rate",
+            value: stats.currentFeeRate,
+            sub: stats.feesNormal ? "normal" : "ABNORMAL — check!",
+          },
+        ].map((card) => (
+          <div key={card.label} className="bg-card-bg border border-card-border rounded-xl p-4">
+            <div className="text-xs text-muted uppercase tracking-wide mb-1">{card.label}</div>
+            <div className="text-xl font-mono font-bold">{card.value}</div>
+            <div className={`text-xs mt-1 ${card.label === "Fee Rate" && !stats.feesNormal ? "text-loss" : "text-muted"}`}>
+              {card.sub}
+            </div>
           </div>
-          <div className="text-xl font-mono font-bold">{card.value}</div>
-          {card.sub && (
-            <div className="text-xs text-muted mt-1">{card.sub}</div>
-          )}
+        ))}
+      </div>
+
+      {/* Exit reason breakdown bar */}
+      {totalExits > 0 && (
+        <div className="bg-card-bg border border-card-border rounded-xl p-4">
+          <div className="text-xs text-muted uppercase tracking-wide mb-3">Exit Breakdown</div>
+          <div className="flex h-4 rounded-full overflow-hidden mb-3">
+            {Object.entries(stats.exitBreakdown).map(([reason, count]) => (
+              <div
+                key={reason}
+                className={`${EXIT_COLORS[reason] ?? "bg-gray-600"}`}
+                style={{ width: `${(count / totalExits) * 100}%` }}
+                title={`${EXIT_LABELS[reason] ?? reason}: ${count}`}
+              />
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-3 text-xs">
+            {Object.entries(stats.exitBreakdown)
+              .sort((a, b) => b[1] - a[1])
+              .map(([reason, count]) => (
+                <div key={reason} className="flex items-center gap-1">
+                  <span className={`w-2 h-2 rounded-full ${EXIT_COLORS[reason] ?? "bg-gray-600"}`} />
+                  <span className="text-muted">{EXIT_LABELS[reason] ?? reason}:</span>
+                  <span className="font-mono">{count} ({((count / totalExits) * 100).toFixed(0)}%)</span>
+                </div>
+              ))}
+          </div>
         </div>
-      ))}
+      )}
     </div>
   );
 }

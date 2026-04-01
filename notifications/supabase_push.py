@@ -78,6 +78,10 @@ def push_trade(trade: dict) -> bool:
             "exit_price": trade.get("exit_price"),
             "hold_duration_seconds": trade.get("hold_duration_seconds"),
             "return_pct": trade.get("return_pct"),
+            "fee_rate": trade.get("fee_rate"),
+            "fees_paid": trade.get("fees_paid"),
+            "net_profit_after_fees": trade.get("net_profit_after_fees"),
+            "num_entries_this_window": trade.get("num_entries_this_window"),
         }
 
         client.table("trades").insert(row).execute()

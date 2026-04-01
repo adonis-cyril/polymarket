@@ -26,6 +26,10 @@ export interface Trade {
   exit_price: number | null;
   hold_duration_seconds: number | null;
   return_pct: number | null;
+  fee_rate: number | null;
+  fees_paid: number | null;
+  net_profit_after_fees: number | null;
+  num_entries_this_window: number | null;
   created_at: string;
 }
 

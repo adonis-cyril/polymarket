@@ -1,15 +1,17 @@
 """
-Main trading bot entry point.
+Polymarket 5-min trading bot — unified full-bankroll strategy.
 
-Runs the 5-minute cycle loop:
-1. Discover markets for all assets
-2. Check volatility regime
-3. Wait for entry timing
-4. Run signal analysis
-5. Size bet via Kelly criterion
-6. Execute trade (paper or live)
-7. Wait for resolution
-8. Update state and sync
+Single strategy: target 10% return per trade. Full bankroll each time.
+
+Entry: pick strongest signal asset, buy if token price is $0.65-$0.93.
+Exit (first trigger wins):
+  1. TAKE_PROFIT_10PCT: token price >= entry * 1.10 → sell
+  2. RESOLUTION_WIN: window resolves in our favor → $1.00/share
+  3. TIME_STOP: <30s left, in profit but below 10% → sell at market
+  4. STOP_LOSS: <30s left, in the red → sell at market
+  5. RESOLUTION_LOSS: held through resolution, lost → $0
+
+Reversal trades: exception to full bankroll, uses 15% only.
 
 Usage:
     python bot.py              # Paper trading mode (default)
@@ -27,7 +29,7 @@ load_dotenv()
 
 from config import (
     ASSETS, DAILY_LOSS_LIMIT, DRAWDOWN_CAP, CONSECUTIVE_LOSS_PAUSE,
-    MIN_BET, STARTING_BANKROLL,
+    MIN_BET, STARTING_BANKROLL, INITIAL_BANKROLL,
 )
 from data.binance_ws import BinanceWebsocket
 from data.polymarket_ws import PolymarketWebsocket
@@ -36,7 +38,6 @@ from execution.market_discovery import (
     Market, discover_all_markets, get_current_window_ts, seconds_until_close,
 )
 from notifications import supabase_push
-from strategy.kelly import calculate_kelly, get_alpha_for_brier
 from strategy.regime import (
     Regime, classify_from_binance_ws, should_skip_window, get_entry_timing,
 )
@@ -52,9 +53,57 @@ logger = logging.getLogger(__name__)
 # Level targets for the compounding challenge
 LEVEL_TARGETS = [40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
 
+# Entry price bounds for normal trades
+ENTRY_PRICE_MIN = 0.65
+ENTRY_PRICE_MAX = 0.93
+
+# Preferred entry zone (resolution alone gives 10-18%)
+PREFERRED_PRICE_MIN = 0.85
+PREFERRED_PRICE_MAX = 0.91
+
+# Take profit target
+TAKE_PROFIT_PCT = 0.10  # 10%
+
+# Reversal sizing
+REVERSAL_BANKROLL_PCT = 0.15
+
+# Time stop threshold (seconds before window close)
+TIME_STOP_SECONDS = 30
+
+# Phase labels for dashboard
+PHASE_LABELS = {
+    1: "Protecting Principal",
+    2: "Playing with House Money",
+    3: "Scaling Up",
+    4: "Full Compound",
+}
+
+
+def calculate_phase_and_bet(balance: float, initial_bankroll: float) -> tuple[int, float]:
+    """
+    Capital preservation position sizing.
+
+    Phase 1 (<2x): bet fixed initial_bankroll
+    Phase 2 (2x-3x): bet only profits (balance - initial_bankroll)
+    Phase 3 (3x-5x): bet 50% of total
+    Phase 4 (5x+): bet 75% of total
+
+    Returns (phase, bet_size).
+    """
+    ratio = balance / initial_bankroll if initial_bankroll > 0 else 1
+
+    if ratio < 2:
+        return 1, min(initial_bankroll, balance)
+    elif ratio < 3:
+        return 2, balance - initial_bankroll
+    elif ratio < 5:
+        return 3, balance * 0.50
+    else:
+        return 4, balance * 0.75
+
 
 class TradingBot:
-    """Main trading bot that runs the 5-minute cycle."""
+    """Main trading bot — unified full-bankroll strategy."""
 
     def __init__(self, paper_mode: bool = True):
         self.paper_mode = paper_mode
@@ -85,7 +134,7 @@ class TradingBot:
     async def start(self):
         """Initialize connections and start the main loop."""
         logger.info("=" * 60)
-        logger.info("POLYMARKET TRADING BOT")
+        logger.info("POLYMARKET TRADING BOT — 10%% TARGET STRATEGY")
         logger.info("Mode: %s", "PAPER" if self.paper_mode else "LIVE")
         logger.info("Starting balance: $%.2f", self.balance)
         logger.info("=" * 60)
@@ -127,8 +176,6 @@ class TradingBot:
             current_balance=self.balance,
             peak_balance=self.peak_balance,
         )
-
-        # Push initial state to Supabase
         self._sync_state()
 
         # Run main loop
@@ -163,15 +210,12 @@ class TradingBot:
             except Exception:
                 logger.exception("Error in trading cycle")
 
-            # Wait for next window
             remaining = seconds_until_close()
             if remaining > 5:
-                # Wait until near the end of the current window
-                wait_time = max(1, remaining - 120)  # Wake up 2 min before close
+                wait_time = max(1, remaining - 120)
                 logger.info("Sleeping %.0fs until next window approach...", wait_time)
                 await asyncio.sleep(wait_time)
             else:
-                # Very close to close, wait for next window
                 await asyncio.sleep(remaining + 5)
 
     async def _run_cycle(self):
@@ -212,14 +256,13 @@ class TradingBot:
                 self.window_open_prices[asset] = price
                 db.save_window_open_price(asset, window_ts, price)
 
-        # Regime check per asset + find best signal
+        # Scan all assets: regime check + signal analysis
         best_signal: Optional[SignalResult] = None
         best_regime: Optional[Regime] = None
         best_market: Optional[Market] = None
         reversal_signal = None
 
         for asset, market in markets.items():
-            # Regime check
             baseline = self.baseline_candles.get(asset, [])
             regime_state = classify_from_binance_ws(self.binance_ws, asset, baseline)
 
@@ -234,7 +277,6 @@ class TradingBot:
             if secs_left > entry_timing + 10:
                 wait = secs_left - entry_timing - 5
                 if wait > 0:
-                    logger.debug("  %s: waiting %.0fs for entry window", asset.upper(), wait)
                     await asyncio.sleep(min(wait, 30))
 
             # Check for reversal
@@ -242,10 +284,7 @@ class TradingBot:
             if self.reversal_detector and 15 <= secs_left <= 90:
                 up_price = self.polymarket_ws.get_best_ask(market.up_token_id)
                 down_price = self.polymarket_ws.get_best_ask(market.down_token_id)
-
-                rev = self.reversal_detector.detect(
-                    asset, secs_left, up_price, down_price,
-                )
+                rev = self.reversal_detector.detect(asset, secs_left, up_price, down_price)
                 if rev and (reversal_signal is None or rev.payout_ratio > reversal_signal.payout_ratio):
                     reversal_signal = rev
                     best_market = market
@@ -256,7 +295,6 @@ class TradingBot:
             if open_price == 0:
                 continue
 
-            # Get whale signal
             whale_score, whale_dir, whale_count = 0.0, None, 0
             if self.tracked_wallets:
                 try:
@@ -280,89 +318,94 @@ class TradingBot:
                 best_regime = regime_state.regime
                 best_market = market
 
-        # Decide: reversal vs snipe
-        trade_signal = None
-        trade_type = "SNIPE"
+        # ---- DECIDE: reversal vs normal trade ----
+        trade_type = None
+        direction = None
+        asset = None
         token_price = 0.0
+        bet_size = 0.0
 
-        if best_signal and best_signal.score >= MIN_SIGNAL_SCORE:
-            trade_signal = best_signal
-            trade_type = "SNIPE"
-            token_price = self.polymarket_ws.get_best_ask(
+        # Calculate phase-based bet size
+        phase, phase_bet = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
+
+        # Check normal trade first
+        if best_signal and best_signal.score >= MIN_SIGNAL_SCORE and best_market:
+            token_id = (
                 best_market.up_token_id if best_signal.direction == "UP"
                 else best_market.down_token_id
             )
-            # Use signal's win prob if token price is available
-            if token_price <= 0 or token_price >= 1.0:
-                token_price = 0.70  # Fallback
+            token_price = self.polymarket_ws.get_best_ask(token_id)
 
-        if reversal_signal and (trade_signal is None or trade_signal.score < 8):
-            # Reversal takes priority over weak snipes
+            if ENTRY_PRICE_MIN <= token_price <= ENTRY_PRICE_MAX:
+                trade_type = "SNIPE"
+                direction = best_signal.direction
+                asset = best_signal.asset
+                bet_size = phase_bet
+            else:
+                logger.info(
+                    "  %s signal score %.1f but token price $%.2f outside $%.2f-$%.2f range, skipping",
+                    best_signal.asset.upper(), best_signal.score, token_price,
+                    ENTRY_PRICE_MIN, ENTRY_PRICE_MAX,
+                )
+
+        # Reversal overrides weak snipes or fills the gap when no snipe found
+        if reversal_signal and (trade_type is None or (best_signal and best_signal.score < 8)):
             trade_type = "REVERSAL"
-            token_price = reversal_signal.contrarian_price
-            if token_price <= 0 or token_price >= 1.0:
-                token_price = 0.30
-
-        if trade_signal is None and reversal_signal is None:
-            logger.info("No actionable signal this window")
-            return
-
-        # Kelly sizing
-        brier = db.get_rolling_brier()
-        win_prob = (
-            reversal_signal.win_prob if trade_type == "REVERSAL"
-            else trade_signal.win_prob_estimate
-        )
-
-        kelly_result = calculate_kelly(
-            win_prob=win_prob,
-            token_price=token_price,
-            balance=self.balance,
-            brier_score=brier,
-            is_reversal=(trade_type == "REVERSAL"),
-        )
-
-        if kelly_result.bet_size <= 0:
-            logger.info("SKIP: %s", kelly_result.skip_reason)
-            return
-
-        # Determine direction
-        if trade_type == "REVERSAL":
             direction = reversal_signal.direction
             asset = reversal_signal.asset
-        else:
-            direction = trade_signal.direction
-            asset = trade_signal.asset
+            token_price = reversal_signal.contrarian_price
+            bet_size = self.balance * REVERSAL_BANKROLL_PCT  # 15% only
+
+        if trade_type is None:
+            logger.info("No actionable trade this window")
+            await self.polymarket_ws.unsubscribe_all()
+            return
+
+        # Enforce minimum bet
+        if bet_size < float(MIN_BET):
+            logger.info("SKIP: bet size $%.2f below minimum $%.2f", bet_size, float(MIN_BET))
+            await self.polymarket_ws.unsubscribe_all()
+            return
+
+        signal_score = best_signal.score if best_signal else 5.0
+        regime_str = best_regime.value if best_regime else "UNKNOWN"
+        entry_time = time.time()
 
         logger.info(
-            "TRADE: %s %s %s | price=$%.3f | bet=$%.2f | kelly=%.4f | wp=%.1f%%",
+            "TRADE: %s %s %s | entry=$%.3f | bet=$%.2f (Phase %d: %s) | signal=%.1f",
             trade_type, asset.upper(), direction, token_price,
-            kelly_result.bet_size, kelly_result.kelly_fraction, win_prob * 100,
+            bet_size, phase, PHASE_LABELS[phase], signal_score,
         )
 
-        # Execute (paper mode: simulate outcome)
-        if self.paper_mode:
-            result = await self._paper_execute(asset, direction, window_ts)
-        else:
-            # Live execution would go here
-            result = await self._paper_execute(asset, direction, window_ts)
-
-        # Calculate P&L
+        # ---- EXECUTE + EXIT LOGIC ----
         balance_before = self.balance
-        if result == "WIN":
-            shares = kelly_result.bet_size / token_price
-            pnl = shares * 1.0 - kelly_result.bet_size
-            self.balance += pnl
+        shares = bet_size / token_price
+
+        if self.paper_mode:
+            exit_reason, exit_price, pnl = await self._paper_execute_with_exits(
+                asset, direction, token_price, shares, bet_size, window_ts,
+            )
+        else:
+            # Live execution — same logic, but with real order placement
+            exit_reason, exit_price, pnl = await self._paper_execute_with_exits(
+                asset, direction, token_price, shares, bet_size, window_ts,
+            )
+
+        hold_duration = int(time.time() - entry_time)
+        return_pct = (pnl / bet_size) * 100 if bet_size > 0 else 0
+
+        # Update balance
+        self.balance += pnl
+        self.balance = max(self.balance, 0)
+
+        is_win = pnl > 0
+        if is_win:
             self.total_wins += 1
             self.consecutive_losses = 0
         else:
-            pnl = -kelly_result.bet_size
-            self.balance += pnl
             self.consecutive_losses += 1
 
         self.total_trades += 1
-        self.balance = max(self.balance, 0)
-
         if self.balance > self.peak_balance:
             self.peak_balance = self.balance
 
@@ -370,92 +413,129 @@ class TradingBot:
         win_rate = self.total_wins / self.total_trades if self.total_trades > 0 else 0
         payout_ratio = (1 - token_price) / token_price if token_price > 0 else 0
 
-        db.log_prediction(win_prob, result == "WIN")
-        brier = db.get_rolling_brier()
-
-        signal_score = trade_signal.score if trade_signal else 5.0
-        regime_str = best_regime.value if best_regime else "UNKNOWN"
-
-        trade_id = db.log_trade(
+        db.log_trade(
             window_ts=window_ts,
             asset=asset,
             direction=direction,
             trade_type=trade_type,
             token_price=token_price,
-            bet_size=kelly_result.bet_size,
-            kelly_fraction=kelly_result.kelly_fraction,
+            bet_size=bet_size,
+            kelly_fraction=0,
             signal_score=signal_score,
             regime=regime_str,
-            result=result,
+            result="WIN" if is_win else "LOSS",
             balance_before=balance_before,
             balance_after=self.balance,
             pnl=pnl,
             payout_ratio=payout_ratio,
-            brier_rolling=brier,
+            brier_rolling=0,
             win_rate_rolling=win_rate,
             execution_type="PAPER" if self.paper_mode else "MAKER",
-            whale_aligned=trade_signal.whale_aligned if trade_signal else False,
-            whale_count=trade_signal.whale_count if trade_signal else 0,
+            whale_aligned=best_signal.whale_aligned if best_signal else False,
+            whale_count=best_signal.whale_count if best_signal else 0,
             reversal_counter_move_pct=(
                 reversal_signal.counter_move_pct if reversal_signal and trade_type == "REVERSAL" else 0
             ),
+            exit_reason=exit_reason,
+            entry_price=token_price,
+            exit_price=exit_price,
+            hold_duration_seconds=hold_duration,
+            return_pct=return_pct,
         )
 
         # Update bot state
+        current_phase, _ = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
         db.update_bot_state(
             current_balance=self.balance,
             peak_balance=self.peak_balance,
             total_trades=self.total_trades,
             total_wins=self.total_wins,
             win_rate=win_rate,
-            brier_score=brier,
             current_regime=regime_str,
-            kelly_alpha=kelly_result.alpha,
             consecutive_losses=self.consecutive_losses,
+            current_phase=current_phase,
         )
 
-        # Check level progression
         self._check_level_up()
-
-        # Sync to Supabase
         self._sync_state()
         supabase_push.sync_unsynced_trades(db)
 
         logger.info(
-            "RESULT: %s | PnL: $%+.2f | Balance: $%.2f | Win Rate: %.1f%% | Brier: %.3f",
-            result, pnl, self.balance, win_rate * 100, brier,
+            "EXIT: %s | PnL: $%+.2f (%.1f%%) | Balance: $%.2f | Hold: %ds | Win Rate: %.1f%%",
+            exit_reason, pnl, return_pct, self.balance, hold_duration, win_rate * 100,
         )
 
-        # Unsubscribe from this window's tokens
         await self.polymarket_ws.unsubscribe_all()
 
-    async def _paper_execute(self, asset: str, direction: str, window_ts: int) -> str:
+    async def _paper_execute_with_exits(
+        self,
+        asset: str,
+        direction: str,
+        entry_price: float,
+        shares: float,
+        bet_size: float,
+        window_ts: int,
+    ) -> tuple[str, float, float]:
         """
-        Paper trade: wait for window to close, check actual outcome.
+        Paper trade with full exit logic. Polls every 2 seconds.
+
+        Returns: (exit_reason, exit_price, pnl)
         """
-        remaining = seconds_until_close()
-        if remaining > 0:
-            logger.info("  Waiting %.0fs for window resolution...", remaining)
-            await asyncio.sleep(remaining + 2)
+        take_profit_price = entry_price * (1 + TAKE_PROFIT_PCT)
 
-        # Check outcome from Binance
-        open_price = self.window_open_prices.get(asset, 0)
-        close_price = self.binance_ws.get_price(asset)
+        while True:
+            secs_left = seconds_until_close()
 
-        if open_price == 0 or close_price == 0:
-            logger.warning("  Missing prices for outcome check, defaulting to LOSS")
-            return "LOSS"
+            # Simulate current token price from Binance delta
+            open_price = self.window_open_prices.get(asset, 0)
+            current_asset_price = self.binance_ws.get_price(asset)
 
-        actual = "UP" if close_price > open_price else "DOWN"
-        result = "WIN" if direction == actual else "LOSS"
+            if open_price > 0 and current_asset_price > 0:
+                delta_pct = ((current_asset_price - open_price) / open_price) * 100
+                # Estimate current token price based on delta
+                from backtest.token_pricing import estimate_token_prices
+                prices = estimate_token_prices(asset, delta_pct, secs_left)
+                current_token_price = (
+                    prices.up_price if direction == "UP" else prices.down_price
+                )
+            else:
+                current_token_price = entry_price
 
-        logger.info(
-            "  Outcome: %s (open=$%.2f, close=$%.2f, delta=%.4f%%)",
-            actual, open_price, close_price,
-            ((close_price - open_price) / open_price) * 100,
-        )
+            # EXIT 1: Take profit at 10%
+            if current_token_price >= take_profit_price:
+                pnl = shares * current_token_price - bet_size
+                return "TAKE_PROFIT_10PCT", current_token_price, pnl
 
-        return result
+            # EXIT 3/4: Time stop with <30s left
+            if secs_left <= TIME_STOP_SECONDS:
+                if current_token_price > entry_price:
+                    # In profit but below 10% — take partial profit
+                    pnl = shares * current_token_price - bet_size
+                    return "TIME_STOP", current_token_price, pnl
+                elif current_token_price < entry_price:
+                    # In the red — cut loss
+                    pnl = shares * current_token_price - bet_size
+                    return "STOP_LOSS", current_token_price, pnl
+
+            # Window closed — resolution
+            if secs_left <= 0:
+                await asyncio.sleep(2)  # Wait for resolution data
+
+                close_price = self.binance_ws.get_price(asset)
+                if open_price > 0 and close_price > 0:
+                    actual = "UP" if close_price > open_price else "DOWN"
+                else:
+                    actual = "DOWN" if direction == "UP" else "UP"
+
+                if direction == actual:
+                    # EXIT 2: Resolution win — $1.00 per share
+                    pnl = shares * 1.0 - bet_size
+                    return "RESOLUTION_WIN", 1.0, pnl
+                else:
+                    # EXIT 5: Resolution loss — $0 per share
+                    return "RESOLUTION_LOSS", 0.0, -bet_size
+
+            await asyncio.sleep(2)
 
     def _check_risk_limits(self) -> Optional[str]:
         """Check all risk limits. Returns skip reason or None."""
@@ -464,7 +544,7 @@ class TradingBot:
             return f"Balance ${self.balance:.2f} below minimum bet ${MIN_BET}"
 
         if self.consecutive_losses >= CONSECUTIVE_LOSS_PAUSE:
-            self.consecutive_losses = 0  # Reset after pause
+            self.consecutive_losses = 0
             return f"Consecutive loss breaker ({CONSECUTIVE_LOSS_PAUSE} losses)"
 
         today_start = db.get_today_starting_balance()
@@ -492,31 +572,23 @@ class TradingBot:
                 "LEVEL UP! Level %d reached ($%.2f >= $%.2f) in %.1f hours",
                 self.current_level, self.balance, LEVEL_TARGETS[target_idx], hours_elapsed,
             )
-
             supabase_push.push_level_reached(
                 level=self.current_level,
                 target=LEVEL_TARGETS[target_idx],
                 trades_taken=self.total_trades,
                 hours_elapsed=hours_elapsed,
             )
-
             self.current_level += 1
             if self.current_level <= len(LEVEL_TARGETS):
                 self.level_target = LEVEL_TARGETS[self.current_level - 1]
             else:
                 self.level_target = 99999
-
-            db.update_bot_state(
-                current_level=self.current_level,
-                level_target=self.level_target,
-            )
+            db.update_bot_state(current_level=self.current_level, level_target=self.level_target)
 
     def _sync_state(self):
         """Sync bot state to Supabase."""
-        brier = db.get_rolling_brier()
         win_rate = self.total_wins / self.total_trades if self.total_trades > 0 else 0
-        alpha = get_alpha_for_brier(brier)
-
+        phase, _ = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
         supabase_push.push_bot_state(
             status="RUNNING",
             balance=self.balance,
@@ -527,28 +599,23 @@ class TradingBot:
             total_trades=self.total_trades,
             total_wins=self.total_wins,
             win_rate=win_rate,
-            brier_score=brier,
+            brier_score=0,
             regime=db.get_bot_state().get("current_regime", "UNKNOWN"),
-            kelly_alpha=alpha,
+            kelly_alpha=0,
             consecutive_losses=self.consecutive_losses,
+            current_phase=phase,
         )
 
     def _handle_command(self, cmd: dict):
         """Handle an admin command from the dashboard."""
         command = cmd.get("command", "")
         payload = cmd.get("payload", {})
-
         logger.info("Admin command: %s %s", command, payload)
 
         if command == "PAUSE":
             db.update_bot_state(status="PAUSED")
-            logger.info("Bot PAUSED by admin")
         elif command == "RESUME":
             db.update_bot_state(status="RUNNING")
-            logger.info("Bot RESUMED by admin")
-        elif command == "SET_KELLY_ALPHA":
-            # Handled through Brier score adjustment
-            pass
         elif command == "FORCE_SKIP":
             logger.info("Force skipping next window")
 

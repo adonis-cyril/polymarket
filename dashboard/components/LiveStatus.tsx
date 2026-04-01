@@ -63,6 +63,20 @@ export default function LiveStatus() {
   const balance = state.current_balance ?? 0;
   const level = state.current_level ?? 1;
   const target = state.level_target ?? 40;
+  const phase = state.current_phase ?? 1;
+
+  const phaseLabels: Record<number, string> = {
+    1: "Protecting Principal",
+    2: "Playing with House Money",
+    3: "Scaling Up",
+    4: "Full Compound",
+  };
+  const phaseColors: Record<number, string> = {
+    1: "text-yellow-400",
+    2: "text-green-400",
+    3: "text-accent",
+    4: "text-purple-400",
+  };
 
   return (
     <div className="bg-card-bg border border-card-border rounded-xl p-6">
@@ -78,6 +92,12 @@ export default function LiveStatus() {
 
       <div className="text-5xl font-mono font-bold text-accent mb-2">
         ${balance.toFixed(2)}
+      </div>
+
+      <div className="flex items-center gap-3 text-sm mb-2">
+        <span className={`font-mono font-bold ${phaseColors[phase] ?? "text-muted"}`}>
+          Phase {phase}: {phaseLabels[phase] ?? "Unknown"}
+        </span>
       </div>
 
       <div className="text-muted text-sm">

@@ -94,7 +94,7 @@ export default function RecentTrades() {
                   ${trade.bet_size.toFixed(2)}
                 </td>
                 <td className="py-2 pr-3 text-center">
-                  <div className="flex items-center justify-center gap-1">
+                  <div className="flex items-center justify-center gap-1 flex-wrap">
                     <span
                       className={
                         trade.result === "WIN" ? "text-win" : "text-loss"
@@ -102,6 +102,23 @@ export default function RecentTrades() {
                     >
                       {trade.result === "WIN" ? "\u2713" : "\u2717"}
                     </span>
+                    {trade.exit_reason && (
+                      <span className={`text-[10px] px-1 rounded ${
+                        trade.exit_reason === "TAKE_PROFIT_10PCT" ? "bg-green-900/30 text-green-400" :
+                        trade.exit_reason === "RESOLUTION_WIN" ? "bg-accent/20 text-accent" :
+                        trade.exit_reason === "TIME_STOP" ? "bg-yellow-900/30 text-yellow-400" :
+                        trade.exit_reason === "STOP_LOSS" ? "bg-red-900/30 text-red-400" :
+                        trade.exit_reason === "RESOLUTION_LOSS" ? "bg-red-900/30 text-red-400" :
+                        "bg-card-border text-muted"
+                      }`}>
+                        {trade.exit_reason === "TAKE_PROFIT_10PCT" ? "10% TP" :
+                         trade.exit_reason === "RESOLUTION_WIN" ? "RES W" :
+                         trade.exit_reason === "TIME_STOP" ? "TIME" :
+                         trade.exit_reason === "STOP_LOSS" ? "SL" :
+                         trade.exit_reason === "RESOLUTION_LOSS" ? "RES L" :
+                         trade.exit_reason}
+                      </span>
+                    )}
                     {trade.trade_type === "REVERSAL" && (
                       <span className="text-[10px] bg-orange-900/30 text-orange-400 px-1 rounded">
                         REV

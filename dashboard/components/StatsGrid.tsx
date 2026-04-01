@@ -8,11 +8,11 @@ interface Stats {
   winRate: string;
   totalTrades: number;
   reversalCount: number;
-  kellyAlpha: string;
-  brierScore: string;
+  targetHitRate: string;
+  avgReturn: string;
+  avgHoldDuration: string;
   bestTrade: string;
   reversalWinRate: string;
-  reversalAvgPayout: string;
   whaleAlignment: string;
 }
 
@@ -40,27 +40,52 @@ export default function StatsGrid() {
 
       const best = allTrades[0];
       const bestStr = best
-        ? `+$${(best.pnl ?? 0).toFixed(2)} (${best.asset.toUpperCase()}, ${best.trade_type})`
+        ? `+$${(best.pnl ?? 0).toFixed(2)} (${best.asset.toUpperCase()})`
         : "N/A";
 
-      const avgPayout =
-        reversals.length > 0
-          ? reversals.reduce((s, t) => s + (t.payout_ratio ?? 0), 0) /
-            reversals.length
+      // 10% target hit rate: trades where return_pct >= 10 OR exit_reason is TAKE_PROFIT_10PCT or RESOLUTION_WIN
+      const targetHits = allTrades.filter(
+        (t) =>
+          (t.return_pct !== null && t.return_pct >= 10) ||
+          t.exit_reason === "TAKE_PROFIT_10PCT" ||
+          t.exit_reason === "RESOLUTION_WIN"
+      );
+      const targetHitRate =
+        allTrades.length > 0
+          ? `${((targetHits.length / allTrades.length) * 100).toFixed(1)}%`
+          : "N/A";
+
+      // Average return per trade
+      const returnsWithData = allTrades.filter((t) => t.return_pct !== null);
+      const avgReturn =
+        returnsWithData.length > 0
+          ? `${(returnsWithData.reduce((s, t) => s + (t.return_pct ?? 0), 0) / returnsWithData.length).toFixed(1)}%`
+          : "N/A";
+
+      // Average hold duration
+      const holdsWithData = allTrades.filter(
+        (t) => t.hold_duration_seconds !== null && t.hold_duration_seconds > 0
+      );
+      const avgHoldSecs =
+        holdsWithData.length > 0
+          ? holdsWithData.reduce((s, t) => s + (t.hold_duration_seconds ?? 0), 0) /
+            holdsWithData.length
           : 0;
+      const avgHoldDuration =
+        avgHoldSecs > 0 ? `${Math.round(avgHoldSecs)}s` : "N/A";
 
       setStats({
         winRate: `${((s.win_rate ?? 0) * 100).toFixed(1)}%`,
         totalTrades: s.total_trades,
         reversalCount: reversals.length,
-        kellyAlpha: (s.kelly_alpha ?? 0).toFixed(2),
-        brierScore: (s.brier_score ?? 0).toFixed(3),
+        targetHitRate,
+        avgReturn,
+        avgHoldDuration,
         bestTrade: bestStr,
         reversalWinRate:
           reversals.length > 0
             ? `${((reversalWins.length / reversals.length) * 100).toFixed(1)}%`
             : "N/A",
-        reversalAvgPayout: avgPayout > 0 ? `${avgPayout.toFixed(1)}x` : "N/A",
         whaleAlignment:
           allTrades.length > 0
             ? `${((whaleAligned.length / allTrades.length) * 100).toFixed(0)}%`
@@ -106,22 +131,22 @@ export default function StatsGrid() {
   }
 
   const cards = [
-    { label: "Win Rate", value: stats.winRate, sub: "last 50 trades" },
+    { label: "Win Rate", value: stats.winRate, sub: `${stats.totalTrades} trades (${stats.reversalCount} reversals)` },
     {
-      label: "Total Trades",
-      value: stats.totalTrades.toString(),
-      sub: `${stats.reversalCount} reversals`,
+      label: "10% Target Hit Rate",
+      value: stats.targetHitRate,
+      sub: "trades reaching 10%+ return",
     },
     {
-      label: "Kelly Alpha",
-      value: stats.kellyAlpha,
-      sub: `Brier: ${stats.brierScore}`,
+      label: "Avg Return / Trade",
+      value: stats.avgReturn,
+      sub: `avg hold: ${stats.avgHoldDuration}`,
     },
     { label: "Best Trade", value: stats.bestTrade, sub: "" },
     {
       label: "Reversals",
-      value: `${stats.reversalWinRate} win`,
-      sub: `Avg payout: ${stats.reversalAvgPayout}`,
+      value: `${stats.reversalWinRate} win rate`,
+      sub: `${stats.reversalCount} reversal trades`,
     },
     {
       label: "Whale Alignment",

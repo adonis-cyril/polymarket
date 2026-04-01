@@ -73,6 +73,11 @@ def push_trade(trade: dict) -> bool:
             "whale_aligned": bool(trade.get("whale_aligned", False)),
             "whale_count": trade.get("whale_count", 0),
             "reversal_counter_move_pct": trade.get("reversal_counter_move_pct"),
+            "exit_reason": trade.get("exit_reason"),
+            "entry_price": trade.get("entry_price"),
+            "exit_price": trade.get("exit_price"),
+            "hold_duration_seconds": trade.get("hold_duration_seconds"),
+            "return_pct": trade.get("return_pct"),
         }
 
         client.table("trades").insert(row).execute()
@@ -96,6 +101,7 @@ def push_bot_state(
     regime: str,
     kelly_alpha: float,
     consecutive_losses: int,
+    current_phase: int = 1,
 ) -> bool:
     """Push bot state update to Supabase."""
     client = _get_client()
@@ -118,6 +124,7 @@ def push_bot_state(
             "current_regime": regime,
             "kelly_alpha": round(kelly_alpha, 4),
             "consecutive_losses": consecutive_losses,
+            "current_phase": current_phase,
             "last_trade_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }

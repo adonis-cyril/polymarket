@@ -39,8 +39,8 @@ GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 
 # Bot config
 STARTING_BANKROLL = Decimal(os.getenv("STARTING_BANKROLL", "20.00"))
+INITIAL_BANKROLL = float(os.getenv("INITIAL_BANKROLL", "10.00"))
 MIN_BET = Decimal(os.getenv("MIN_BET", "4.75"))
-MAX_KELLY_ALPHA = float(os.getenv("MAX_KELLY_ALPHA", "0.40"))
 DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.20"))
 DRAWDOWN_CAP = float(os.getenv("DRAWDOWN_CAP", "0.40"))
 CONSECUTIVE_LOSS_PAUSE = int(os.getenv("CONSECUTIVE_LOSS_PAUSE", "5"))

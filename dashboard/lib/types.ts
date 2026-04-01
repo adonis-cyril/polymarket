@@ -21,6 +21,11 @@ export interface Trade {
   whale_aligned: boolean;
   whale_count: number;
   reversal_counter_move_pct: number | null;
+  exit_reason: string | null;
+  entry_price: number | null;
+  exit_price: number | null;
+  hold_duration_seconds: number | null;
+  return_pct: number | null;
   created_at: string;
 }
 
@@ -39,6 +44,7 @@ export interface BotState {
   current_regime: string | null;
   kelly_alpha: number | null;
   consecutive_losses: number;
+  current_phase: number | null;
   last_trade_at: string | null;
   updated_at: string | null;
 }

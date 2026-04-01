@@ -1,19 +1,23 @@
 """
-Polymarket 5-min trading bot — active position management.
+Polymarket 5-min trading bot — active position management strategy.
 
-Targets 10% net profit per trade after fees. Uses quarter-Kelly sizing
-within capital preservation phases. Actively manages positions: can exit
-early (take profit, stop loss, edge vanishing) and re-enter up to 3 times
-per window.
+Core philosophy:
+- Target 10% net profit per trade (after fees)
+- Size bets using fractional Kelly (quarter-Kelly default)
+- Actively manage positions: buy/sell contracts mid-window
+- Re-enter within the same window up to 3 times
 
-Exit triggers (first fires):
-  1. TAKE_PROFIT_10PCT:     token >= entry * 1.10 (after fees)
-  2. RESOLUTION_WIN:        window resolves in our favor
-  3. ACCEPTABLE_PROFIT:     token >= entry * 1.07, conviction fading, <45s
-  4. EDGE_VANISHED_PROFIT:  signal dropped <1.5 but still in profit
-  5. BREAKEVEN_EXIT:        signal dropped <1.0, price near entry
-  6. STOP_LOSS:             token <= entry * 0.92 or <20s and losing
-  7. RESOLUTION_LOSS:       held through resolution, lost
+Exit triggers (first one fires):
+  1. TAKE_PROFIT_10PCT: token >= entry * 1.10 (after fees)
+  2. RESOLUTION_WIN: window resolves in our favor
+  3. ACCEPTABLE_PROFIT: token >= entry * 1.07 + conviction fading + <45s left
+  4. EDGE_VANISHED_PROFIT: signal dropped below 1.5 + in profit
+  5. BREAKEVEN_EXIT: signal dropped below 1.0 + near breakeven
+  6. STOP_LOSS: token <= entry * 0.92 OR <20s left and losing
+  7. RESOLUTION_LOSS: held through resolution, lost
+
+Special: DONE_DEAL trades (token >= $0.90, <15s, signal >6, whale)
+  → Override Kelly, bet full phase-allowed amount
 
 Usage:
     python bot.py              # Paper trading mode (default)
@@ -29,7 +33,6 @@ from typing import Optional
 from dotenv import load_dotenv
 load_dotenv()
 
-import requests
 from config import (
     ASSETS, DAILY_LOSS_LIMIT, DRAWDOWN_CAP, CONSECUTIVE_LOSS_PAUSE,
     MIN_BET, STARTING_BANKROLL, INITIAL_BANKROLL,
@@ -54,6 +57,7 @@ from whale_tracking.wallet_db import get_tracked_addresses
 
 logger = logging.getLogger(__name__)
 
+# Level targets
 LEVEL_TARGETS = [40, 80, 160, 320, 640, 1280, 2560, 5120, 10240]
 
 # Entry price bounds
@@ -61,27 +65,28 @@ ENTRY_PRICE_MIN = 0.65
 ENTRY_PRICE_MAX = 0.93
 
 # Exit thresholds
-TAKE_PROFIT_MULT = 1.10       # 10% take profit
-ACCEPTABLE_PROFIT_MULT = 1.07 # 7% acceptable
-STOP_LOSS_MULT = 0.92         # 8% stop loss
-EDGE_VANISH_SCORE = 1.5       # Signal score below which edge is gone
-BREAKEVEN_SCORE = 1.0         # Signal score for breakeven exit
-BREAKEVEN_PRICE_PCT = 0.02    # Within 2% of entry = roughly breakeven
+TAKE_PROFIT_MULT = 1.10       # 10% gross profit target
+ACCEPTABLE_PROFIT_MULT = 1.07 # 7% acceptable profit
+STOP_LOSS_MULT = 0.92         # 8% max drawdown
+EDGE_VANISH_SCORE = 1.5       # Signal score below this = edge vanishing
+BREAKEVEN_SCORE = 1.0         # Signal score below this = get out flat
+BREAKEVEN_TOLERANCE = 0.02    # 2% around entry = "breakeven"
+
+# Timing thresholds
+ACCEPTABLE_PROFIT_SECS = 45   # Take 7% if < 45s remain
+STOP_LOSS_TIME_SECS = 20      # Cut loss if < 20s remain and losing
+MIN_REENTRY_SECS = 90         # Minimum time for re-entry
 
 # Re-entry limits
 MAX_ENTRIES_PER_WINDOW = 3
-MIN_SECONDS_FOR_REENTRY = 90
 
 # Reversal sizing
 REVERSAL_BANKROLL_PCT = 0.15
 
-# Fee threshold
-MAX_ACCEPTABLE_FEE_PCT = 3.0  # Pause if round-trip fees > 3%
-MIN_NET_PROFIT_PCT = 7.0      # Only enter if estimated net >= 7%
+# Fee safety
+MAX_ROUND_TRIP_FEE_PCT = 0.03  # 3% round-trip = abnormal, pause
 
-# CLOB fee endpoint
-CLOB_FEE_URL = "https://clob.polymarket.com/fee-rate"
-
+# Phase labels
 PHASE_LABELS = {
     1: "Protecting Principal",
     2: "Playing with House Money",
@@ -91,7 +96,10 @@ PHASE_LABELS = {
 
 
 def calculate_phase_and_bet(balance: float, initial_bankroll: float) -> tuple[int, float]:
-    """Capital preservation phase sizing."""
+    """
+    Capital preservation: returns (phase, max_phase_allowed_bet).
+    Kelly then sizes within this ceiling.
+    """
     ratio = balance / initial_bankroll if initial_bankroll > 0 else 1
     if ratio < 2:
         return 1, min(initial_bankroll, balance)
@@ -103,18 +111,12 @@ def calculate_phase_and_bet(balance: float, initial_bankroll: float) -> tuple[in
         return 4, balance * 0.75
 
 
-def fetch_fee_rate() -> float:
-    """Fetch current Polymarket fee rate. Returns fee as decimal (e.g., 0.02 = 2%)."""
-    try:
-        resp = requests.get(CLOB_FEE_URL, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-        # API returns maker/taker rates
-        maker = float(data.get("maker", 0))
-        taker = float(data.get("taker", 0.02))
-        return maker  # We use maker orders primarily
-    except Exception:
-        return 0.0  # Assume 0 if can't fetch (maker orders are often 0 fee)
+def estimate_fee_rate() -> float:
+    """
+    Query Polymarket fee rate. For now returns default.
+    TODO: In live mode, query GET /fee-rate from CLOB API.
+    """
+    return 0.005  # 0.5% per side (1% round-trip) — conservative estimate
 
 
 class TradingBot:
@@ -126,6 +128,7 @@ class TradingBot:
         self.polymarket_ws = PolymarketWebsocket()
         self.reversal_detector: Optional[ReversalDetector] = None
 
+        # State
         self.balance = float(STARTING_BANKROLL)
         self.peak_balance = self.balance
         self.current_level = 1
@@ -134,18 +137,23 @@ class TradingBot:
         self.total_trades = 0
         self.total_wins = 0
         self.start_time = time.time()
-        self.current_fee_rate = 0.0
 
+        # Whale data
         self.tracked_wallets: set[str] = set()
         self.whale_profiles: list[WalletProfile] = []
+
+        # Baseline candles for regime
         self.baseline_candles: dict[str, list] = {}
+
+        # Window open prices
         self.window_open_prices: dict[str, float] = {}
 
     async def start(self):
         """Initialize and run."""
         logger.info("=" * 60)
-        logger.info("POLYMARKET BOT — Active Management + 10%% Target")
-        logger.info("Mode: %s | Balance: $%.2f", "PAPER" if self.paper_mode else "LIVE", self.balance)
+        logger.info("POLYMARKET BOT — ACTIVE MANAGEMENT + KELLY")
+        logger.info("Mode: %s", "PAPER" if self.paper_mode else "LIVE")
+        logger.info("Starting balance: $%.2f", self.balance)
         logger.info("=" * 60)
 
         db.init_db()
@@ -158,8 +166,11 @@ class TradingBot:
             self.current_level = state.get("current_level", 1)
             logger.info("Resumed: $%.2f, %d trades", self.balance, self.total_trades)
 
+        logger.info("Connecting to Binance WS...")
         await self.binance_ws.start()
+        logger.info("Connecting to Polymarket CLOB WS...")
         await self.polymarket_ws.start()
+
         self.reversal_detector = ReversalDetector(self.binance_ws)
 
         try:
@@ -197,205 +208,89 @@ class TradingBot:
     async def _main_loop(self):
         while True:
             try:
-                await self._run_window()
+                await self._run_cycle()
             except Exception:
                 logger.exception("Error in trading cycle")
 
             remaining = seconds_until_close()
             if remaining > 5:
-                await asyncio.sleep(max(1, remaining - 120))
+                wait_time = max(1, remaining - 120)
+                logger.info("Sleeping %.0fs...", wait_time)
+                await asyncio.sleep(wait_time)
             else:
                 await asyncio.sleep(remaining + 5)
 
-    async def _run_window(self):
-        """Run a single 5-min window: scan, enter, manage, exit, repeat."""
+    async def _run_cycle(self):
+        """One 5-min window cycle. Supports re-entry up to MAX_ENTRIES_PER_WINDOW."""
         window_ts = get_current_window_ts()
-        remaining = seconds_until_close()
+        entries_this_window = 0
 
-        logger.info("--- Window %d | %.0fs left | $%.2f ---", window_ts, remaining, self.balance)
+        logger.info("--- Window %d | Balance: $%.2f ---", window_ts, self.balance)
 
         # Admin commands
         for cmd in supabase_push.check_commands():
             self._handle_command(cmd)
 
-        # Risk checks
-        skip = self._check_risk_limits()
-        if skip:
-            logger.info("SKIP: %s", skip)
-            return
-
         # Fee check
-        self.current_fee_rate = fetch_fee_rate()
-        round_trip_fee_pct = self.current_fee_rate * 2 * 100
-        if round_trip_fee_pct > MAX_ACCEPTABLE_FEE_PCT:
-            logger.warning("PAUSE: fees abnormally high (%.2f%% round trip)", round_trip_fee_pct)
+        fee_rate = estimate_fee_rate()
+        round_trip_fee = fee_rate * 2
+        if round_trip_fee > MAX_ROUND_TRIP_FEE_PCT:
+            logger.error("ABNORMAL FEES: %.2f%% round-trip > %.2f%%. Pausing.", round_trip_fee * 100, MAX_ROUND_TRIP_FEE_PCT * 100)
+            db.update_bot_state(status="PAUSED")
             return
 
-        # Discover markets
+        # Discover markets + subscribe
         markets = discover_all_markets(window_ts)
         if not markets:
             return
 
-        for m in markets.values():
-            await self.polymarket_ws.subscribe(m.up_token_id, m.down_token_id)
+        for market in markets.values():
+            await self.polymarket_ws.subscribe(market.up_token_id, market.down_token_id)
 
-        # Capture open prices
+        # Capture window open prices
         for asset in markets:
             price = self.binance_ws.get_price(asset)
             if price > 0:
                 self.window_open_prices[asset] = price
                 db.save_window_open_price(asset, window_ts, price)
 
-        # --- ENTRY + MANAGEMENT LOOP (can re-enter up to 3 times) ---
-        entries_this_window = 0
-
+        # Trade loop: can re-enter up to MAX_ENTRIES_PER_WINDOW times
         while entries_this_window < MAX_ENTRIES_PER_WINDOW:
-            secs_left = seconds_until_close()
-            if secs_left < 20:
+            skip = self._check_risk_limits()
+            if skip:
+                logger.info("SKIP: %s", skip)
+                break
+
+            remaining = seconds_until_close()
+            if remaining < MIN_REENTRY_SECS and entries_this_window > 0:
+                logger.info("Not enough time for re-entry (%.0fs left)", remaining)
+                break
+            if remaining < 30:
+                logger.info("Window nearly closed, skipping entry")
                 break
 
             # Find best opportunity
-            opportunity = await self._find_best_opportunity(markets, window_ts)
+            opportunity = await self._find_best_opportunity(markets, window_ts, fee_rate)
             if not opportunity:
-                break
-
-            trade_type = opportunity["trade_type"]
-            asset = opportunity["asset"]
-            direction = opportunity["direction"]
-            token_price = opportunity["token_price"]
-            signal_score = opportunity["signal_score"]
-            regime = opportunity["regime"]
-            whale_count = opportunity["whale_count"]
-            whale_aligned = opportunity["whale_aligned"]
-            market = opportunity["market"]
-
-            # Position sizing
-            phase, phase_amount = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
-
-            if trade_type == "REVERSAL":
-                bet_size = self.balance * REVERSAL_BANKROLL_PCT
-            elif trade_type == "DONE_DEAL":
-                bet_size = phase_amount  # Full port of phase amount
-            else:
-                # Quarter-Kelly within phase amount
-                win_prob = opportunity.get("win_prob", 0.70)
-                bet_size = calculate_kelly_bet(win_prob, token_price, phase_amount)
-
-            if bet_size < float(MIN_BET):
-                if self.balance >= float(MIN_BET):
-                    bet_size = float(MIN_BET)
-                else:
-                    break
-
-            bet_size = min(bet_size, self.balance)
-
-            # Check estimated net profit after fees
-            payout_ratio = (1.0 - token_price) / token_price
-            estimated_gross_pct = payout_ratio * 100
-            estimated_net_pct = estimated_gross_pct - (round_trip_fee_pct)
-            if estimated_net_pct < MIN_NET_PROFIT_PCT and trade_type not in ("REVERSAL", "DONE_DEAL"):
-                logger.info("SKIP: estimated net profit %.1f%% < %.1f%% minimum", estimated_net_pct, MIN_NET_PROFIT_PCT)
+                if entries_this_window == 0:
+                    logger.info("No actionable signal this window")
                 break
 
             entries_this_window += 1
-            entry_time = time.time()
-            shares = bet_size / token_price
-            fees_on_entry = bet_size * self.current_fee_rate
 
-            logger.info(
-                "ENTER #%d: %s %s %s | $%.3f | $%.2f bet | Phase %d | signal=%.1f",
-                entries_this_window, trade_type, asset.upper(), direction,
-                token_price, bet_size, phase, signal_score,
+            # Execute trade with active management
+            await self._execute_and_manage(
+                opportunity, window_ts, fee_rate, entries_this_window,
             )
 
-            # --- ACTIVE POSITION MANAGEMENT ---
-            exit_reason, exit_price, gross_pnl = await self._manage_position(
-                asset, direction, token_price, shares, bet_size,
-                signal_score, regime, market, window_ts,
-            )
-
-            hold_duration = int(time.time() - entry_time)
-            fees_on_exit = (shares * exit_price) * self.current_fee_rate if exit_price > 0 else 0
-            total_fees = fees_on_entry + fees_on_exit
-            net_pnl = gross_pnl - total_fees
-            return_pct = (net_pnl / bet_size) * 100 if bet_size > 0 else 0
-
-            # Update balance
-            balance_before = self.balance
-            self.balance += net_pnl
-            self.balance = max(self.balance, 0)
-
-            is_win = net_pnl > 0
-            if is_win:
-                self.total_wins += 1
-                self.consecutive_losses = 0
-            else:
-                self.consecutive_losses += 1
-            self.total_trades += 1
-
-            if self.balance > self.peak_balance:
-                self.peak_balance = self.balance
-
-            win_rate = self.total_wins / self.total_trades
-
-            # Log trade
-            db.log_trade(
-                window_ts=window_ts, asset=asset, direction=direction,
-                trade_type=trade_type, token_price=token_price,
-                bet_size=bet_size, kelly_fraction=DEFAULT_KELLY_FRACTION,
-                signal_score=signal_score, regime=regime,
-                result="WIN" if is_win else "LOSS",
-                balance_before=balance_before, balance_after=self.balance,
-                pnl=round(gross_pnl, 4),
-                payout_ratio=round(payout_ratio, 4),
-                brier_rolling=0, win_rate_rolling=win_rate,
-                execution_type="PAPER" if self.paper_mode else "MAKER",
-                whale_aligned=whale_aligned, whale_count=whale_count,
-                reversal_counter_move_pct=opportunity.get("counter_move_pct", 0),
-                exit_reason=exit_reason,
-                entry_price=token_price, exit_price=exit_price,
-                hold_duration_seconds=hold_duration,
-                return_pct=round(return_pct, 4),
-                fee_rate=self.current_fee_rate,
-                fees_paid=round(total_fees, 4),
-                net_profit_after_fees=round(net_pnl, 4),
-                num_entries_this_window=entries_this_window,
-            )
-
-            current_phase, _ = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
-            db.update_bot_state(
-                current_balance=self.balance, peak_balance=self.peak_balance,
-                total_trades=self.total_trades, total_wins=self.total_wins,
-                win_rate=win_rate, current_regime=regime,
-                consecutive_losses=self.consecutive_losses,
-                current_phase=current_phase,
-            )
-
-            logger.info(
-                "EXIT: %s | Gross: $%+.2f | Fees: $%.2f | Net: $%+.2f (%.1f%%) | Bal: $%.2f | %ds hold",
-                exit_reason, gross_pnl, total_fees, net_pnl, return_pct, self.balance, hold_duration,
-            )
-
-            # Can we re-enter?
-            secs_left = seconds_until_close()
-            profitable_exit = exit_reason in ("TAKE_PROFIT_10PCT", "ACCEPTABLE_PROFIT", "EDGE_VANISHED_PROFIT")
-            if not (profitable_exit and secs_left > MIN_SECONDS_FOR_REENTRY):
-                break
-
-            logger.info("Re-entry eligible: %.0fs remaining, scanning...", secs_left)
-
-        # End of window
-        self._check_level_up()
-        self._sync_state()
-        supabase_push.sync_unsynced_trades(db)
         await self.polymarket_ws.unsubscribe_all()
 
     async def _find_best_opportunity(
-        self, markets: dict[str, Market], window_ts: int,
+        self, markets: dict[str, Market], window_ts: int, fee_rate: float,
     ) -> Optional[dict]:
         """Scan all assets and return the best trade opportunity."""
         best_signal: Optional[SignalResult] = None
-        best_regime_str = "UNKNOWN"
+        best_regime: Optional[Regime] = None
         best_market: Optional[Market] = None
         reversal_signal = None
 
@@ -418,13 +313,13 @@ class TradingBot:
 
             # Reversal check
             if self.reversal_detector and 15 <= secs_left <= 90:
-                up_p = self.polymarket_ws.get_best_ask(market.up_token_id)
-                down_p = self.polymarket_ws.get_best_ask(market.down_token_id)
-                rev = self.reversal_detector.detect(asset, secs_left, up_p, down_p)
+                up_price = self.polymarket_ws.get_best_ask(market.up_token_id)
+                down_price = self.polymarket_ws.get_best_ask(market.down_token_id)
+                rev = self.reversal_detector.detect(asset, secs_left, up_price, down_price)
                 if rev and (reversal_signal is None or rev.payout_ratio > reversal_signal.payout_ratio):
                     reversal_signal = rev
                     best_market = market
-                    best_regime_str = regime_state.regime.value
+                    best_regime = regime_state.regime
 
             # Signal stack
             open_price = self.window_open_prices.get(asset, 0)
@@ -449,7 +344,7 @@ class TradingBot:
 
             if signal and (best_signal is None or signal.score > best_signal.score):
                 best_signal = signal
-                best_regime_str = regime_state.regime.value
+                best_regime = regime_state.regime
                 best_market = market
 
         # Build opportunity dict
@@ -459,62 +354,100 @@ class TradingBot:
                 else best_market.down_token_id
             )
             token_price = self.polymarket_ws.get_best_ask(token_id)
-            secs_left = seconds_until_close()
 
-            # Check done-deal conditions
-            if is_done_deal(token_price, secs_left, best_signal.score,
-                            best_regime_str, best_signal.whale_count):
-                return {
-                    "trade_type": "DONE_DEAL",
-                    "asset": best_signal.asset, "direction": best_signal.direction,
-                    "token_price": token_price, "signal_score": best_signal.score,
-                    "regime": best_regime_str, "whale_count": best_signal.whale_count,
-                    "whale_aligned": best_signal.whale_aligned, "market": best_market,
-                    "win_prob": 0.95,
-                }
-
-            # Normal entry within price bounds
             if ENTRY_PRICE_MIN <= token_price <= ENTRY_PRICE_MAX:
-                return {
-                    "trade_type": "SNIPE",
-                    "asset": best_signal.asset, "direction": best_signal.direction,
-                    "token_price": token_price, "signal_score": best_signal.score,
-                    "regime": best_regime_str, "whale_count": best_signal.whale_count,
-                    "whale_aligned": best_signal.whale_aligned, "market": best_market,
-                    "win_prob": best_signal.win_prob_estimate,
-                }
+                # Check net profit after fees is at least 7%
+                net_return_on_resolution = ((1.0 / token_price) - 1) - (fee_rate * 2)
+                if net_return_on_resolution < 0.07 and token_price > 0.91:
+                    logger.info("  %s: net return %.1f%% < 7%% at $%.2f, skipping",
+                                best_signal.asset.upper(), net_return_on_resolution * 100, token_price)
+                else:
+                    secs_left = seconds_until_close()
+                    regime_str = best_regime.value if best_regime else "UNKNOWN"
 
-        # Reversal fallback
+                    # Check done-deal conditions
+                    whale_count = best_signal.whale_count
+                    done_deal = is_done_deal(token_price, secs_left, best_signal.score, regime_str, whale_count)
+
+                    # Kelly sizing
+                    phase, phase_allowed = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
+
+                    if done_deal:
+                        bet_size = phase_allowed
+                        trade_type = "DONE_DEAL"
+                    else:
+                        bet_size = calculate_kelly_bet(
+                            win_prob=best_signal.win_prob_estimate,
+                            token_price=token_price,
+                            phase_allowed_amount=phase_allowed,
+                        )
+                        trade_type = "SNIPE"
+
+                    if bet_size >= float(MIN_BET):
+                        return {
+                            "trade_type": trade_type,
+                            "direction": best_signal.direction,
+                            "asset": best_signal.asset,
+                            "token_price": token_price,
+                            "bet_size": bet_size,
+                            "signal": best_signal,
+                            "regime": regime_str,
+                            "market": best_market,
+                            "phase": phase,
+                            "token_id": token_id,
+                        }
+
+        # Reversal opportunity
         if reversal_signal and best_market:
-            return {
-                "trade_type": "REVERSAL",
-                "asset": reversal_signal.asset, "direction": reversal_signal.direction,
-                "token_price": reversal_signal.contrarian_price,
-                "signal_score": 5.0, "regime": best_regime_str,
-                "whale_count": 0, "whale_aligned": False, "market": best_market,
-                "win_prob": reversal_signal.win_prob,
-                "counter_move_pct": reversal_signal.counter_move_pct,
-            }
+            bet_size = self.balance * REVERSAL_BANKROLL_PCT
+            if bet_size >= float(MIN_BET):
+                return {
+                    "trade_type": "REVERSAL",
+                    "direction": reversal_signal.direction,
+                    "asset": reversal_signal.asset,
+                    "token_price": reversal_signal.contrarian_price,
+                    "bet_size": bet_size,
+                    "signal": best_signal,
+                    "regime": best_regime.value if best_regime else "UNKNOWN",
+                    "market": best_market,
+                    "phase": calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)[0],
+                    "reversal": reversal_signal,
+                    "token_id": "",
+                }
 
         return None
 
-    async def _manage_position(
-        self, asset: str, direction: str, entry_price: float,
-        shares: float, bet_size: float, entry_signal_score: float,
-        regime: str, market: Market, window_ts: int,
-    ) -> tuple[str, float, float]:
-        """
-        Actively manage a position. Polls every 1.5 seconds.
-        Returns (exit_reason, exit_price, gross_pnl).
-        """
-        take_profit_target = entry_price * TAKE_PROFIT_MULT
-        acceptable_target = entry_price * ACCEPTABLE_PROFIT_MULT
-        stop_loss_level = entry_price * STOP_LOSS_MULT
+    async def _execute_and_manage(
+        self, opp: dict, window_ts: int, fee_rate: float, entry_num: int,
+    ):
+        """Enter position and actively manage it until exit."""
+        trade_type = opp["trade_type"]
+        direction = opp["direction"]
+        asset = opp["asset"]
+        entry_price = opp["token_price"]
+        bet_size = min(opp["bet_size"], self.balance)
+        signal = opp.get("signal")
+        regime = opp["regime"]
+        phase = opp["phase"]
+        entry_signal_score = signal.score if signal else 5.0
 
-        while True:
+        shares = bet_size / entry_price
+        entry_time = time.time()
+
+        logger.info(
+            "ENTER: %s %s %s | $%.3f | $%.2f (Phase %d) | signal=%.1f | entry #%d",
+            trade_type, asset.upper(), direction, entry_price,
+            bet_size, phase, entry_signal_score, entry_num,
+        )
+
+        # Active management loop — poll every 1.5 seconds
+        exit_reason = None
+        exit_price = 0.0
+
+        while exit_reason is None:
             secs_left = seconds_until_close()
 
-            # Estimate current token price from Binance delta
+            # Simulate current token price from Binance delta
             open_price = self.window_open_prices.get(asset, 0)
             current_asset_price = self.binance_ws.get_price(asset)
 
@@ -526,56 +459,36 @@ class TradingBot:
             else:
                 current_token_price = entry_price
 
-            # Re-run signal for conviction tracking
+            # Re-run signal stack to check if conviction holds
+            market = opp.get("market")
             current_signal_score = entry_signal_score  # Default
-            try:
-                signal = analyze_signals(
-                    self.binance_ws, self.polymarket_ws, market, open_price,
-                )
-                if signal:
-                    current_signal_score = signal.score
-                    # Flip: if signal now favors opposite direction, score is negative for us
-                    if signal.direction != direction:
-                        current_signal_score = -signal.score
-            except Exception:
-                pass
+            if market and open_price > 0:
+                try:
+                    sig = analyze_signals(
+                        self.binance_ws, self.polymarket_ws, market, open_price,
+                    )
+                    if sig:
+                        current_signal_score = sig.score
+                except Exception:
+                    pass
 
-            in_profit = current_token_price > entry_price
-            profit_pct = ((current_token_price - entry_price) / entry_price) * 100
+            # Calculate gross/net P&L
+            gross_pnl = shares * current_token_price - bet_size
+            sell_fee = current_token_price * shares * fee_rate
+            buy_fee = bet_size * fee_rate
+            net_pnl = gross_pnl - buy_fee - sell_fee
+            net_return_pct = (net_pnl / bet_size) * 100 if bet_size > 0 else 0
 
-            # EXIT 1: Take profit at 10%
-            if current_token_price >= take_profit_target:
-                pnl = shares * current_token_price - bet_size
-                return "TAKE_PROFIT_10PCT", current_token_price, pnl
+            # --- EXIT CHECKS (priority order) ---
 
-            # EXIT 3: Acceptable profit (7%+, conviction fading, <45s)
-            if (current_token_price >= acceptable_target
-                    and secs_left < 45
-                    and current_signal_score < entry_signal_score * 0.7):
-                pnl = shares * current_token_price - bet_size
-                return "ACCEPTABLE_PROFIT", current_token_price, pnl
+            # 1. TAKE PROFIT: 10% net profit
+            net_tp_price = entry_price * TAKE_PROFIT_MULT
+            if current_token_price >= net_tp_price and net_return_pct >= 7:
+                exit_reason = "TAKE_PROFIT_10PCT"
+                exit_price = current_token_price
+                break
 
-            # EXIT 4: Edge vanishing but in profit
-            if current_signal_score < EDGE_VANISH_SCORE and in_profit:
-                pnl = shares * current_token_price - bet_size
-                return "EDGE_VANISHED_PROFIT", current_token_price, pnl
-
-            # EXIT 5: Breakeven exit (signal collapsed, price near entry)
-            if (current_signal_score < BREAKEVEN_SCORE
-                    and abs(profit_pct) < BREAKEVEN_PRICE_PCT * 100):
-                pnl = shares * current_token_price - bet_size
-                return "BREAKEVEN_EXIT", current_token_price, pnl
-
-            # EXIT 6: Stop loss
-            if current_token_price <= stop_loss_level:
-                pnl = shares * current_token_price - bet_size
-                return "STOP_LOSS", current_token_price, pnl
-
-            if secs_left < 20 and not in_profit:
-                pnl = shares * current_token_price - bet_size
-                return "STOP_LOSS", current_token_price, pnl
-
-            # Window closed — resolution
+            # 2. Window closed → resolution
             if secs_left <= 0:
                 await asyncio.sleep(2)
                 close_price = self.binance_ws.get_price(asset)
@@ -585,17 +498,145 @@ class TradingBot:
                     actual = "DOWN" if direction == "UP" else "UP"
 
                 if direction == actual:
-                    pnl = shares * 1.0 - bet_size
-                    return "RESOLUTION_WIN", 1.0, pnl
+                    exit_reason = "RESOLUTION_WIN"
+                    exit_price = 1.0
                 else:
-                    return "RESOLUTION_LOSS", 0.0, -bet_size
+                    exit_reason = "RESOLUTION_LOSS"
+                    exit_price = 0.0
+                break
+
+            # 3. ACCEPTABLE PROFIT: 7%+ and conviction fading, <45s
+            if (current_token_price >= entry_price * ACCEPTABLE_PROFIT_MULT
+                    and secs_left < ACCEPTABLE_PROFIT_SECS
+                    and current_signal_score < entry_signal_score * 0.7):
+                exit_reason = "ACCEPTABLE_PROFIT"
+                exit_price = current_token_price
+                break
+
+            # 4. EDGE VANISHED but in profit
+            if (current_signal_score < EDGE_VANISH_SCORE
+                    and current_signal_score < entry_signal_score
+                    and current_token_price > entry_price):
+                exit_reason = "EDGE_VANISHED_PROFIT"
+                exit_price = current_token_price
+                break
+
+            # 5. BREAKEVEN EXIT: signal collapsed, near entry price
+            if (current_signal_score < BREAKEVEN_SCORE
+                    and abs(current_token_price - entry_price) / entry_price < BREAKEVEN_TOLERANCE):
+                exit_reason = "BREAKEVEN_EXIT"
+                exit_price = current_token_price
+                break
+
+            # 6. STOP LOSS: 8% drawdown OR <20s and losing
+            if current_token_price <= entry_price * STOP_LOSS_MULT:
+                exit_reason = "STOP_LOSS"
+                exit_price = current_token_price
+                break
+
+            if secs_left < STOP_LOSS_TIME_SECS and current_token_price < entry_price:
+                exit_reason = "STOP_LOSS"
+                exit_price = current_token_price
+                break
 
             await asyncio.sleep(1.5)
+
+        # Calculate final P&L
+        if exit_price == 1.0:
+            # Resolution win
+            gross_pnl = shares * 1.0 - bet_size
+            fees = bet_size * fee_rate  # Only entry fee, no sell fee on resolution
+        elif exit_price == 0.0:
+            # Resolution loss
+            gross_pnl = -bet_size
+            fees = bet_size * fee_rate
+        else:
+            # Sold mid-window
+            gross_pnl = shares * exit_price - bet_size
+            fees = bet_size * fee_rate + shares * exit_price * fee_rate
+
+        net_pnl = gross_pnl - fees
+        hold_duration = int(time.time() - entry_time)
+        return_pct = (net_pnl / bet_size) * 100 if bet_size > 0 else 0
+
+        # Update balance
+        balance_before = self.balance
+        self.balance += net_pnl
+        self.balance = max(self.balance, 0)
+
+        is_win = net_pnl > 0
+        if is_win:
+            self.total_wins += 1
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+        self.total_trades += 1
+
+        if self.balance > self.peak_balance:
+            self.peak_balance = self.balance
+
+        win_rate = self.total_wins / self.total_trades if self.total_trades > 0 else 0
+
+        # Log trade
+        reversal_sig = opp.get("reversal")
+        db.log_trade(
+            window_ts=window_ts,
+            asset=asset,
+            direction=direction,
+            trade_type=trade_type,
+            token_price=entry_price,
+            bet_size=bet_size,
+            kelly_fraction=DEFAULT_KELLY_FRACTION,
+            signal_score=entry_signal_score,
+            regime=regime,
+            result="WIN" if is_win else "LOSS",
+            balance_before=balance_before,
+            balance_after=self.balance,
+            pnl=round(gross_pnl, 4),
+            payout_ratio=round((1 - entry_price) / entry_price, 4) if entry_price > 0 else 0,
+            brier_rolling=0,
+            win_rate_rolling=win_rate,
+            execution_type="PAPER" if self.paper_mode else "MAKER",
+            whale_aligned=signal.whale_aligned if signal else False,
+            whale_count=signal.whale_count if signal else 0,
+            reversal_counter_move_pct=reversal_sig.counter_move_pct if reversal_sig else 0,
+            exit_reason=exit_reason,
+            entry_price=entry_price,
+            exit_price=exit_price,
+            hold_duration_seconds=hold_duration,
+            return_pct=round(return_pct, 4),
+            fee_rate=fee_rate,
+            fees_paid=round(fees, 4),
+            net_profit_after_fees=round(net_pnl, 4),
+            num_entries_this_window=entry_num,
+        )
+
+        # Update bot state
+        current_phase, _ = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
+        db.update_bot_state(
+            current_balance=self.balance,
+            peak_balance=self.peak_balance,
+            total_trades=self.total_trades,
+            total_wins=self.total_wins,
+            win_rate=win_rate,
+            current_regime=regime,
+            consecutive_losses=self.consecutive_losses,
+            current_phase=current_phase,
+        )
+
+        self._check_level_up()
+        self._sync_state()
+        supabase_push.sync_unsynced_trades(db)
+
+        logger.info(
+            "EXIT: %s | Gross: $%+.2f | Fees: $%.2f | Net: $%+.2f (%.1f%%) | Balance: $%.2f | Hold: %ds",
+            exit_reason, gross_pnl, fees, net_pnl, return_pct, self.balance, hold_duration,
+        )
 
     def _check_risk_limits(self) -> Optional[str]:
         if self.balance < float(MIN_BET):
             db.update_bot_state(status="BLOWN_UP")
-            return f"Balance ${self.balance:.2f} below minimum"
+            return f"Balance ${self.balance:.2f} below minimum bet"
 
         if self.consecutive_losses >= CONSECUTIVE_LOSS_PAUSE:
             self.consecutive_losses = 0
@@ -620,8 +661,7 @@ class TradingBot:
         idx = self.current_level - 1
         if idx < len(LEVEL_TARGETS) and self.balance >= LEVEL_TARGETS[idx]:
             hours = (time.time() - self.start_time) / 3600
-            logger.info("LEVEL UP! %d ($%.2f >= $%.2f) in %.1fh",
-                        self.current_level, self.balance, LEVEL_TARGETS[idx], hours)
+            logger.info("LEVEL UP! Level %d ($%.2f) in %.1fh", self.current_level, self.balance, hours)
             supabase_push.push_level_reached(self.current_level, LEVEL_TARGETS[idx], self.total_trades, hours)
             self.current_level += 1
             self.level_target = LEVEL_TARGETS[self.current_level - 1] if self.current_level <= len(LEVEL_TARGETS) else 99999
@@ -649,7 +689,7 @@ class TradingBot:
         elif command == "RESUME":
             db.update_bot_state(status="RUNNING")
         elif command == "FORCE_SKIP":
-            logger.info("Force skipping next window")
+            logger.info("Force skip next window")
 
 
 def main():
@@ -657,6 +697,7 @@ def main():
     parser.add_argument("--live", action="store_true", help="Enable live trading")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
     args = parser.parse_args()
+
     setup_logging(args.log_level)
     bot = TradingBot(paper_mode=not args.live)
     asyncio.run(bot.start())

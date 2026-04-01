@@ -29,6 +29,14 @@ POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
 
+# Relayer
+RELAYER_API_KEY = os.getenv("RELAYER_API_KEY", "")
+RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "")
+
+# CLOB API
+POLY_CLOB_URL = "https://clob.polymarket.com"
+POLY_CHAIN_ID = 137  # Polygon mainnet
+
 # Supabase
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")

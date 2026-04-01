@@ -431,13 +431,32 @@ class TradingBot:
         phase = opp["phase"]
         entry_signal_score = signal.score if signal else 5.0
 
-        shares = bet_size / entry_price
         entry_time = time.time()
+        token_id = opp.get("token_id", "")
+        execution_type = "PAPER"
+
+        # --- LIVE ENTRY ---
+        if not self.paper_mode and token_id:
+            from execution.order import place_buy_order, place_sell_order, get_fee_rate
+            from execution.balance import get_usdc_balance, wait_for_balance_update
+            from execution.claim import claim_position
+
+            best_ask = entry_price
+            buy_result = place_buy_order(token_id, bet_size, best_ask)
+            if not buy_result.success:
+                logger.error("ENTRY FAILED: %s", buy_result.error)
+                return
+            entry_price = buy_result.fill_price
+            shares = buy_result.fill_size
+            execution_type = buy_result.execution_type
+            fee_rate = get_fee_rate()
+        else:
+            shares = bet_size / entry_price
 
         logger.info(
-            "ENTER: %s %s %s | $%.3f | $%.2f (Phase %d) | signal=%.1f | entry #%d",
+            "ENTER: %s %s %s | $%.3f | $%.2f (Phase %d) | signal=%.1f | entry #%d | %s",
             trade_type, asset.upper(), direction, entry_price,
-            bet_size, phase, entry_signal_score, entry_num,
+            bet_size, phase, entry_signal_score, entry_num, execution_type,
         )
 
         # Active management loop — poll every 1.5 seconds
@@ -447,17 +466,22 @@ class TradingBot:
         while exit_reason is None:
             secs_left = seconds_until_close()
 
-            # Simulate current token price from Binance delta
-            open_price = self.window_open_prices.get(asset, 0)
-            current_asset_price = self.binance_ws.get_price(asset)
-
-            if open_price > 0 and current_asset_price > 0:
-                delta_pct = ((current_asset_price - open_price) / open_price) * 100
-                from backtest.token_pricing import estimate_token_prices
-                prices = estimate_token_prices(asset, delta_pct, max(secs_left, 1))
-                current_token_price = prices.up_price if direction == "UP" else prices.down_price
+            # Get current token price
+            if not self.paper_mode and token_id:
+                # Live: use CLOB order book for real-time price
+                book = self.polymarket_ws.get_order_book(token_id)
+                current_token_price = book.mid_price if book else entry_price
             else:
-                current_token_price = entry_price
+                # Paper: simulate from Binance delta
+                open_price = self.window_open_prices.get(asset, 0)
+                current_asset_price = self.binance_ws.get_price(asset)
+                if open_price > 0 and current_asset_price > 0:
+                    delta_pct = ((current_asset_price - open_price) / open_price) * 100
+                    from backtest.token_pricing import estimate_token_prices
+                    prices = estimate_token_prices(asset, delta_pct, max(secs_left, 1))
+                    current_token_price = prices.up_price if direction == "UP" else prices.down_price
+                else:
+                    current_token_price = entry_price
 
             # Re-run signal stack to check if conviction holds
             market = opp.get("market")
@@ -541,6 +565,27 @@ class TradingBot:
 
             await asyncio.sleep(1.5)
 
+        # --- LIVE EXIT EXECUTION ---
+        if not self.paper_mode and token_id and exit_reason not in ("RESOLUTION_WIN", "RESOLUTION_LOSS"):
+            urgent = exit_reason in ("STOP_LOSS", "BREAKEVEN_EXIT")
+            sell_result = place_sell_order(token_id, shares, exit_price, urgent=urgent)
+            if sell_result.success:
+                exit_price = sell_result.fill_price
+                execution_type = sell_result.execution_type
+                logger.info("SELL executed: %s at $%.3f", exit_reason, exit_price)
+            else:
+                logger.error("SELL failed: %s — holding through resolution", sell_result.error)
+                # Fall through to resolution
+
+        if not self.paper_mode and exit_reason == "RESOLUTION_WIN":
+            # Wait for balance to update, then claim if needed
+            expected = self.balance + shares * 1.0 - bet_size
+            final_balance = wait_for_balance_update(expected, timeout=30)
+            if final_balance < expected * 0.95:
+                market = opp.get("market")
+                if market:
+                    claim_position(market.condition_id)
+
         # Calculate final P&L
         if exit_price == 1.0:
             # Resolution win
@@ -596,7 +641,7 @@ class TradingBot:
             payout_ratio=round((1 - entry_price) / entry_price, 4) if entry_price > 0 else 0,
             brier_rolling=0,
             win_rate_rolling=win_rate,
-            execution_type="PAPER" if self.paper_mode else "MAKER",
+            execution_type=execution_type,
             whale_aligned=signal.whale_aligned if signal else False,
             whale_count=signal.whale_count if signal else 0,
             reversal_counter_move_pct=reversal_sig.counter_move_pct if reversal_sig else 0,

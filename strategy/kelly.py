@@ -1,148 +1,84 @@
 """
-Brier-tiered fractional Kelly criterion for position sizing.
+Fractional Kelly criterion for position sizing.
 
-Kelly fraction scales with model accuracy (rolling Brier score).
-Better accuracy → more aggressive sizing. Poor accuracy → conservative.
+Quarter-Kelly (25%) by default. Kelly determines what fraction of
+the phase-allowed bet amount to actually risk.
 
-The Brier score measures calibration of probability estimates:
-- 0.0 = perfect (always predicts correctly with correct confidence)
-- 0.25 = random guessing
-- 0.5+ = worse than random
+Full Kelly formula: f = (p * b - q) / b
+  p = estimated win probability
+  b = payout ratio = (1 - token_price) / token_price
+  q = 1 - p
+
+Exception: "done deal" trades (token >= $0.90, <15s left, signal > 6,
+whale confirmation) override Kelly and use 100% of phase-allowed amount.
 """
 
 import logging
-from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# Brier score tiers: (lower_bound, upper_bound) → alpha (fraction of full Kelly)
-BRIER_TIERS = {
-    (0.35, 1.0): 0.10,   # Bad accuracy: very conservative
-    (0.25, 0.35): 0.15,  # Below average
-    (0.15, 0.25): 0.25,  # Good
-    (0.00, 0.15): 0.40,  # Excellent: most aggressive
-}
-
-# Hard limits
-MIN_BET_USDC = 4.75       # Polymarket minimum (5 shares)
-MAX_POSITION_PCT = 0.40   # Never exceed 40% of bankroll
-MAX_REVERSAL_PCT = 0.15   # Reversal trades capped at 15%
+DEFAULT_KELLY_FRACTION = 0.25  # Quarter-Kelly
 
 
-@dataclass
-class KellyResult:
-    """Result of Kelly sizing calculation."""
-    bet_size: float
-    kelly_fraction: float
-    alpha: float
-    win_prob: float
-    payout_odds: float
-    full_kelly: float
-    skip_reason: str = ""
-
-
-def get_alpha_for_brier(brier_score: float) -> float:
-    """Get the fractional Kelly alpha from the current Brier score."""
-    for (low, high), alpha in BRIER_TIERS.items():
-        if low <= brier_score < high:
-            return alpha
-    return 0.10  # Fallback: very conservative
-
-
-def calculate_kelly(
+def calculate_kelly_bet(
     win_prob: float,
     token_price: float,
-    balance: float,
-    brier_score: float,
-    is_reversal: bool = False,
-) -> KellyResult:
+    phase_allowed_amount: float,
+    kelly_fraction: float = DEFAULT_KELLY_FRACTION,
+) -> float:
     """
-    Calculate fractional Kelly bet size.
+    Calculate bet size using fractional Kelly.
 
     Args:
         win_prob: Estimated probability of winning (0-1).
-        token_price: Price of the token we're buying (0-1).
-        balance: Current USDC balance.
-        brier_score: Rolling Brier score of our predictions.
-        is_reversal: True for reversal trades (uses half alpha, lower cap).
+        token_price: Token price we'd buy at (0-1).
+        phase_allowed_amount: Max bet allowed by current capital preservation phase.
+        kelly_fraction: Fraction of full Kelly to use (default 0.25).
 
     Returns:
-        KellyResult with bet size and supporting data.
+        Bet size in USDC. Returns 0 if no edge.
     """
-    # Payout odds: buy at token_price, win pays $1.00
-    if token_price <= 0 or token_price >= 1.0:
-        return KellyResult(
-            bet_size=0, kelly_fraction=0, alpha=0,
-            win_prob=win_prob, payout_odds=0, full_kelly=0,
-            skip_reason="Invalid token price",
-        )
+    if token_price <= 0 or token_price >= 1.0 or win_prob <= 0:
+        return 0.0
 
-    b = (1.0 - token_price) / token_price  # payout odds ratio
+    b = (1.0 - token_price) / token_price  # payout odds
     q = 1.0 - win_prob
 
-    # Full Kelly: f* = (p*b - q) / b
     full_kelly = (win_prob * b - q) / b
 
     if full_kelly <= 0:
-        return KellyResult(
-            bet_size=0, kelly_fraction=0, alpha=0,
-            win_prob=win_prob, payout_odds=b, full_kelly=full_kelly,
-            skip_reason="No edge (Kelly <= 0)",
-        )
+        return 0.0
 
-    # Get alpha from Brier score
-    alpha = get_alpha_for_brier(brier_score)
+    bet_fraction = kelly_fraction * full_kelly
+    bet_size = bet_fraction * phase_allowed_amount
 
-    # Reversal trades: use half alpha
-    if is_reversal:
-        alpha *= 0.5
+    # Clamp to phase-allowed amount
+    bet_size = min(bet_size, phase_allowed_amount)
 
-    fractional_kelly = alpha * full_kelly
-    bet_size = fractional_kelly * balance
+    return round(bet_size, 4)
 
-    # Enforce minimum
-    if bet_size < MIN_BET_USDC:
-        if balance >= MIN_BET_USDC:
-            bet_size = MIN_BET_USDC
-        else:
-            return KellyResult(
-                bet_size=0, kelly_fraction=fractional_kelly, alpha=alpha,
-                win_prob=win_prob, payout_odds=b, full_kelly=full_kelly,
-                skip_reason="Balance below minimum bet",
-            )
 
-    # Enforce maximum
-    max_pct = MAX_REVERSAL_PCT if is_reversal else MAX_POSITION_PCT
-    max_bet = balance * max_pct
-    bet_size = min(bet_size, max_bet)
+def is_done_deal(
+    token_price: float,
+    seconds_left: float,
+    signal_score: float,
+    regime: str,
+    whale_count: int,
+) -> bool:
+    """
+    Check if this is a "done deal" — near-certain resolution win.
 
-    # Never bet more than we have
-    bet_size = min(bet_size, balance)
-
-    return KellyResult(
-        bet_size=round(bet_size, 4),
-        kelly_fraction=round(fractional_kelly, 6),
-        alpha=alpha,
-        win_prob=win_prob,
-        payout_odds=round(b, 4),
-        full_kelly=round(full_kelly, 6),
+    All conditions must be true:
+    - Token price >= $0.90
+    - < 15 seconds remain
+    - Signal score > 6
+    - Regime is not HIGH_VOL
+    - At least 1 whale entered same direction
+    """
+    return (
+        token_price >= 0.90
+        and seconds_left < 15
+        and signal_score > 6
+        and regime != "HIGH_VOL"
+        and whale_count >= 1
     )
-
-
-def update_brier_score(
-    predictions: list[tuple[float, bool]],
-) -> float:
-    """
-    Calculate Brier score from a list of (predicted_prob, actual_outcome) pairs.
-
-    Args:
-        predictions: List of (probability_estimate, did_win) tuples.
-
-    Returns:
-        Brier score (0 = perfect, 0.25 = random, higher = bad).
-    """
-    if not predictions:
-        return 0.30  # Default: slightly below average
-
-    total = sum((prob - (1.0 if won else 0.0)) ** 2 for prob, won in predictions)
-    return total / len(predictions)

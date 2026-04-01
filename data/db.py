@@ -53,6 +53,15 @@ def init_db():
             whale_aligned INTEGER DEFAULT 0,
             whale_count INTEGER DEFAULT 0,
             reversal_counter_move_pct REAL,
+            exit_reason TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            hold_duration_seconds INTEGER,
+            return_pct REAL,
+            fee_rate REAL,
+            fees_paid REAL,
+            net_profit_after_fees REAL,
+            num_entries_this_window INTEGER DEFAULT 1,
             synced_to_supabase INTEGER DEFAULT 0
         );
 
@@ -124,6 +133,15 @@ def log_trade(
     whale_aligned: bool = False,
     whale_count: int = 0,
     reversal_counter_move_pct: float = 0.0,
+    exit_reason: str = "",
+    entry_price: float = 0.0,
+    exit_price: float = 0.0,
+    hold_duration_seconds: int = 0,
+    return_pct: float = 0.0,
+    fee_rate: float = 0.0,
+    fees_paid: float = 0.0,
+    net_profit_after_fees: float = 0.0,
+    num_entries_this_window: int = 1,
 ) -> int:
     """Log a trade to SQLite. Returns the trade ID."""
     conn = get_connection()
@@ -133,14 +151,18 @@ def log_trade(
             token_price, bet_size, kelly_fraction, signal_score, regime,
             result, balance_before, balance_after, pnl, payout_ratio,
             brier_rolling, win_rate_rolling, execution_type,
-            whale_aligned, whale_count, reversal_counter_move_pct
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            whale_aligned, whale_count, reversal_counter_move_pct,
+            exit_reason, entry_price, exit_price, hold_duration_seconds, return_pct,
+            fee_rate, fees_paid, net_profit_after_fees, num_entries_this_window
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         time.time(), window_ts, asset, direction, trade_type,
         token_price, bet_size, kelly_fraction, signal_score, regime,
         result, balance_before, balance_after, pnl, payout_ratio,
         brier_rolling, win_rate_rolling, execution_type,
         1 if whale_aligned else 0, whale_count, reversal_counter_move_pct,
+        exit_reason, entry_price, exit_price, hold_duration_seconds, return_pct,
+        fee_rate, fees_paid, net_profit_after_fees, num_entries_this_window,
     ))
     trade_id = cursor.lastrowid
     conn.commit()

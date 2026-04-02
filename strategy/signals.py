@@ -276,7 +276,7 @@ def analyze_signals(
         binance_ws, market.asset, window_open_price,
     )
 
-    if abs(delta_pct) < 0.01:
+    if abs(delta_pct) < 0.005:
         return None  # No meaningful move
 
     direction = "UP" if delta_pct > 0 else "DOWN"

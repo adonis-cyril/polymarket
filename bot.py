@@ -366,6 +366,25 @@ class TradingBot:
             )
             token_price = self.polymarket_ws.get_best_ask(token_id)
 
+            # If WS order book has no data (returns default 1.0), estimate from Binance delta
+            if token_price >= 0.99:
+                open_price = self.window_open_prices.get(best_signal.asset, 0)
+                current_price = self.binance_ws.get_price(best_signal.asset)
+                if open_price > 0 and current_price > 0:
+                    delta_pct = ((current_price - open_price) / open_price) * 100
+                    secs_left = seconds_until_close()
+                    from backtest.token_pricing import estimate_token_prices
+                    est = estimate_token_prices(best_signal.asset, delta_pct, max(secs_left, 1))
+                    token_price = est.up_ask if best_signal.direction == "UP" else est.down_ask
+                    logger.info("  WS book empty, estimated token_price=$%.3f from delta=%.4f%%", token_price, delta_pct)
+                else:
+                    # Last resort: try Gamma API
+                    from execution.market_discovery import get_market_prices
+                    gamma_prices = get_market_prices(best_market.condition_id)
+                    if gamma_prices:
+                        token_price = gamma_prices["up_price"] if best_signal.direction == "UP" else gamma_prices["down_price"]
+                        logger.info("  WS book empty, Gamma price=$%.3f", token_price)
+
             logger.info(
                 "  Best: %s %s score=%.2f | token_price=$%.3f (range $%.2f-$%.2f)",
                 best_signal.asset.upper(), best_signal.direction,

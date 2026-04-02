@@ -342,10 +342,21 @@ class TradingBot:
                 whale_signal=whale_score, whale_direction=whale_dir, whale_count=whale_count,
             )
 
-            if signal and (best_signal is None or signal.score > best_signal.score):
-                best_signal = signal
-                best_regime = regime_state.regime
-                best_market = market
+            if signal:
+                logger.info(
+                    "  %s: signal=%.2f dir=%s delta=%.4f%% wp=%.1f%%",
+                    asset.upper(), signal.score, signal.direction,
+                    signal.delta_pct, signal.win_prob_estimate * 100,
+                )
+                if signal.score > (best_signal.score if best_signal else 0):
+                    best_signal = signal
+                    best_regime = regime_state.regime
+                    best_market = market
+            else:
+                current_price = self.binance_ws.get_price(asset)
+                if open_price > 0 and current_price > 0:
+                    delta = ((current_price - open_price) / open_price) * 100
+                    logger.debug("  %s: no signal (delta=%.4f%%)", asset.upper(), delta)
 
         # Build opportunity dict
         if best_signal and best_signal.score >= MIN_SIGNAL_SCORE and best_market:
@@ -354,6 +365,12 @@ class TradingBot:
                 else best_market.down_token_id
             )
             token_price = self.polymarket_ws.get_best_ask(token_id)
+
+            logger.info(
+                "  Best: %s %s score=%.2f | token_price=$%.3f (range $%.2f-$%.2f)",
+                best_signal.asset.upper(), best_signal.direction,
+                best_signal.score, token_price, ENTRY_PRICE_MIN, ENTRY_PRICE_MAX,
+            )
 
             if ENTRY_PRICE_MIN <= token_price <= ENTRY_PRICE_MAX:
                 # Check net profit after fees is at least 7%

@@ -4,14 +4,11 @@ import os
 from decimal import Decimal
 
 # Assets traded on Polymarket 5-min markets
-ASSETS = ["btc", "eth", "sol", "xrp"]
+ASSETS = ["btc"]
 
 # Binance trading pair symbols
 BINANCE_SYMBOLS = {
     "btc": "BTCUSDT",
-    "eth": "ETHUSDT",
-    "sol": "SOLUSDT",
-    "xrp": "XRPUSDT",
 }
 
 # Binance websocket base URL

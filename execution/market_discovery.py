@@ -149,8 +149,9 @@ def discover_all_markets(window_ts: Optional[int] = None) -> dict[str, Market]:
     if window_ts is None:
         window_ts = get_current_window_ts()
 
+    from config import ASSETS
     markets = {}
-    for asset in ASSET_SLUGS:
+    for asset in ASSETS:
         market = discover_market(asset, window_ts)
         if market:
             markets[asset] = market

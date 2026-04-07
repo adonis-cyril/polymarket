@@ -10,6 +10,7 @@ Gamma API: https://gamma-api.polymarket.com
 - Returns market metadata including condition IDs and token IDs
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -114,7 +115,11 @@ def discover_market(asset: str, window_ts: Optional[int] = None) -> Optional[Mar
         return None
 
     market_data = markets[0]
-    clob_token_ids = market_data.get("clobTokenIds", [])
+    raw_token_ids = market_data.get("clobTokenIds", [])
+    if isinstance(raw_token_ids, str):
+        clob_token_ids = json.loads(raw_token_ids)
+    else:
+        clob_token_ids = raw_token_ids
 
     if len(clob_token_ids) < 2:
         logger.warning("Market %s missing token IDs", slug)

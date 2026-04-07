@@ -23,8 +23,7 @@ from py_clob_client.clob_types import OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 
 from config import (
-    POLY_PRIVATE_KEY, POLY_API_KEY, POLY_API_SECRET,
-    POLY_API_PASSPHRASE, POLY_FUNDER_ADDRESS, POLY_SIGNATURE_TYPE,
+    POLY_PRIVATE_KEY, POLY_FUNDER_ADDRESS, POLY_SIGNATURE_TYPE,
     POLY_CLOB_URL, POLY_CHAIN_ID,
 )
 
@@ -63,16 +62,8 @@ def get_clob_client() -> ClobClient:
             funder=POLY_FUNDER_ADDRESS,
         )
 
-        # Set API credentials
+        # Derive API credentials from private key (always fresh)
         _client.set_api_creds(_client.create_or_derive_api_creds())
-
-        if POLY_API_KEY:
-            from py_clob_client.clob_types import ApiCreds
-            _client.set_api_creds(ApiCreds(
-                api_key=POLY_API_KEY,
-                api_secret=POLY_API_SECRET,
-                api_passphrase=POLY_API_PASSPHRASE,
-            ))
 
         logger.info("CLOB client initialized for %s", POLY_FUNDER_ADDRESS[:10])
 

@@ -213,12 +213,14 @@ class TradingBot:
                 logger.exception("Error in trading cycle")
 
             remaining = seconds_until_close()
-            if remaining > 5:
-                wait_time = max(1, remaining - 120)
+            if remaining > 120:
+                wait_time = remaining - 120
                 logger.info("Sleeping %.0fs...", wait_time)
                 await asyncio.sleep(wait_time)
             else:
-                await asyncio.sleep(remaining + 5)
+                wait_time = remaining + 5
+                logger.info("Window ending, next cycle in %.0fs...", wait_time)
+                await asyncio.sleep(wait_time)
 
     async def _run_cycle(self):
         """One 5-min window cycle. Supports re-entry up to MAX_ENTRIES_PER_WINDOW."""

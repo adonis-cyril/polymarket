@@ -23,9 +23,6 @@ PRICE_HISTORY_SECONDS = 120    # Keep last 120 seconds of tick prices
 
 # Polymarket
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
-POLY_API_KEY = os.getenv("POLY_API_KEY", "")
-POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
-POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLY_FUNDER_ADDRESS = os.getenv("POLY_FUNDER_ADDRESS", "")
 POLY_SIGNATURE_TYPE = int(os.getenv("POLY_SIGNATURE_TYPE", "1"))
 

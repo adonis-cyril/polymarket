@@ -10,6 +10,7 @@ import logging
 import time
 
 from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
 from execution.order import get_clob_client
 
@@ -23,9 +24,10 @@ def get_usdc_balance() -> float:
     """Get current USDC balance from the CLOB API."""
     try:
         client = get_clob_client()
-        # The py-clob-client has a get_balance method
-        balance_info = client.get_balance_allowance()
-        # balance_info typically has 'balance' field in USDC (as string)
+        params = BalanceAllowanceParams(
+            asset_type=AssetType.COLLATERAL,
+        )
+        balance_info = client.get_balance_allowance(params)
         if isinstance(balance_info, dict):
             balance_str = balance_info.get("balance", "0")
             # Balance is in USDC atomic units (6 decimals)

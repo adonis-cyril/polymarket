@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { BotState } from "@/lib/types";
 
 export default function AdminPanel() {
@@ -14,7 +13,6 @@ export default function AdminPanel() {
   >([]);
   const [sending, setSending] = useState(false);
 
-  // Check if already authenticated
   useEffect(() => {
     fetch("/api/commands", { method: "POST", body: JSON.stringify({ command: "PING" }) })
       .then((r) => {
@@ -26,36 +24,18 @@ export default function AdminPanel() {
   useEffect(() => {
     if (!authenticated) return;
 
-    supabase
-      .from("bot_state")
-      .select("*")
-      .eq("id", 1)
-      .single()
-      .then(({ data }) => {
-        if (data) setState(data as BotState);
-      });
+    async function load() {
+      const [stateRes, cmdRes] = await Promise.all([
+        fetch("/api/bot-state"),
+        fetch("/api/commands"),
+      ]);
+      if (stateRes.ok) setState(await stateRes.json());
+      if (cmdRes.ok) setCommands(await cmdRes.json());
+    }
 
-    supabase
-      .from("commands")
-      .select("*")
-      .order("created_at", { ascending: false })
-      .limit(20)
-      .then(({ data }) => {
-        if (data) setCommands(data);
-      });
-
-    const channel = supabase
-      .channel("admin_state")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "bot_state" },
-        (payload) => setState(payload.new as BotState)
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    load();
+    const interval = setInterval(load, 4000);
+    return () => clearInterval(interval);
   }, [authenticated]);
 
   async function handleLogin(e: React.FormEvent) {
@@ -83,13 +63,8 @@ export default function AdminPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command, payload }),
       });
-      // Refresh commands list
-      const { data } = await supabase
-        .from("commands")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(20);
-      if (data) setCommands(data);
+      const res = await fetch("/api/commands");
+      if (res.ok) setCommands(await res.json());
     } catch {
       // ignore
     }
@@ -138,7 +113,6 @@ export default function AdminPanel() {
         </a>
       </div>
 
-      {/* Controls */}
       <div className="bg-card-bg border border-card-border rounded-xl p-6">
         <h2 className="text-lg font-semibold mb-4">Bot Controls</h2>
         <div className="flex flex-wrap gap-3">
@@ -173,7 +147,6 @@ export default function AdminPanel() {
         </div>
       </div>
 
-      {/* Live State */}
       {state && (
         <div className="bg-card-bg border border-card-border rounded-xl p-6">
           <h2 className="text-lg font-semibold mb-4">Live State</h2>
@@ -238,7 +211,6 @@ export default function AdminPanel() {
         </div>
       )}
 
-      {/* Command History */}
       <div className="bg-card-bg border border-card-border rounded-xl p-6">
         <h2 className="text-lg font-semibold mb-4">Command History</h2>
         <div className="space-y-2">

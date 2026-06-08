@@ -4,6 +4,25 @@ Automated trading bot for Polymarket's 5-minute crypto UP/DOWN markets. It reads
 
 Paper trading is the default. Live execution requires Polymarket CLOB credentials and USDC on Polygon.
 
+## Changes in `yo-alfred`
+
+This branch replaces the Supabase stack with two self-hosted pieces:
+
+### Local PostgreSQL
+
+- **Before:** Supabase hosted Postgres + Realtime subscriptions in the dashboard.
+- **After:** Local PostgreSQL via `docker compose up -d` (`postgres:16` on port 5432).
+- Schema lives in `scripts/init_db.sql` and is applied on first container start.
+- Bot persistence (`data/db.py`, `data/pg.py`), whale wallet tracking, and dashboard API routes (`dashboard/lib/db.ts`, `/api/*`) all read and write through `DATABASE_URL`.
+- Supabase client code (`dashboard/lib/supabase.ts`, `notifications/supabase_push.py`) is removed.
+
+### Telegram bot notifications
+
+- **Before:** Trade and status events were pushed through Supabase.
+- **After:** `notifications/telegram.py` sends alerts via the Telegram Bot API — trade exits, level-ups, pauses, errors, and bot start/stop.
+- Configure with `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` (optional; bot runs without them).
+- `notifications/db_sync.py` handles admin command polling and level milestone updates against PostgreSQL.
+
 ## Architecture
 
 ```

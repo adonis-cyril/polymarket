@@ -10,10 +10,10 @@ import {
   ResponsiveContainer,
   ReferenceLine,
 } from "recharts";
-import { supabase } from "@/lib/supabase";
 import type { Trade } from "@/lib/types";
 
 const LEVEL_TARGETS = [40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+const POLL_MS = 4000;
 
 interface DataPoint {
   timestamp: string;
@@ -26,23 +26,20 @@ export default function EquityCurve() {
 
   useEffect(() => {
     async function fetchTrades() {
-      const { data: trades } = await supabase
-        .from("trades")
-        .select("timestamp, balance_after")
-        .order("timestamp", { ascending: true });
+      const res = await fetch("/api/trades?limit=500&order=asc");
+      if (!res.ok) return;
 
-      if (!trades) return;
-
+      const trades = (await res.json()) as Pick<Trade, "timestamp" | "balance_after">[];
       const points: DataPoint[] = [
         { timestamp: "", balance: 20, tradeNum: 0 },
-        ...trades.map((t: { timestamp: string; balance_after: number }, i: number) => ({
+        ...trades.map((t, i) => ({
           timestamp: new Date(t.timestamp).toLocaleDateString("en-US", {
             month: "short",
             day: "numeric",
             hour: "2-digit",
             minute: "2-digit",
           }),
-          balance: t.balance_after,
+          balance: Number(t.balance_after),
           tradeNum: i + 1,
         })),
       ];
@@ -50,34 +47,8 @@ export default function EquityCurve() {
     }
 
     fetchTrades();
-
-    const channel = supabase
-      .channel("trades_chart")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "trades" },
-        (payload) => {
-          const t = payload.new as Trade;
-          setData((prev) => [
-            ...prev,
-            {
-              timestamp: new Date(t.timestamp).toLocaleDateString("en-US", {
-                month: "short",
-                day: "numeric",
-                hour: "2-digit",
-                minute: "2-digit",
-              }),
-              balance: t.balance_after,
-              tradeNum: prev.length,
-            },
-          ]);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    const interval = setInterval(fetchTrades, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   const maxBalance = Math.max(...data.map((d) => d.balance), 100);

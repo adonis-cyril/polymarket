@@ -43,7 +43,7 @@ from data import db
 from execution.market_discovery import (
     Market, discover_all_markets, get_current_window_ts, seconds_until_close,
 )
-from notifications import supabase_push
+from notifications import db_sync, telegram
 from strategy.kelly import calculate_kelly_bet, is_done_deal, DEFAULT_KELLY_FRACTION
 from strategy.regime import (
     Regime, classify_from_binance_ws, should_skip_window, get_entry_timing,
@@ -183,6 +183,7 @@ class TradingBot:
 
         db.update_bot_state(status="RUNNING", current_balance=self.balance, peak_balance=self.peak_balance)
         self._sync_state()
+        telegram.notify_bot_started("PAPER" if self.paper_mode else "LIVE", self.balance)
 
         try:
             await self._main_loop()
@@ -193,6 +194,7 @@ class TradingBot:
             await self.polymarket_ws.stop()
             db.update_bot_state(status="STOPPED")
             self._sync_state()
+            telegram.notify_bot_stopped(self.balance)
 
     async def _load_baseline_candles(self):
         from data.historical import fetch_candles
@@ -209,8 +211,9 @@ class TradingBot:
         while True:
             try:
                 await self._run_cycle()
-            except Exception:
+            except Exception as e:
                 logger.exception("Error in trading cycle")
+                telegram.notify_error(str(e))
 
             remaining = seconds_until_close()
             if remaining > 120:
@@ -230,15 +233,17 @@ class TradingBot:
         logger.info("--- Window %d | Balance: $%.2f ---", window_ts, self.balance)
 
         # Admin commands
-        for cmd in supabase_push.check_commands():
+        for cmd in db_sync.check_commands():
             self._handle_command(cmd)
 
         # Fee check
         fee_rate = estimate_fee_rate()
         round_trip_fee = fee_rate * 2
         if round_trip_fee > MAX_ROUND_TRIP_FEE_PCT:
-            logger.error("ABNORMAL FEES: %.2f%% round-trip > %.2f%%. Pausing.", round_trip_fee * 100, MAX_ROUND_TRIP_FEE_PCT * 100)
+            msg = f"Abnormal fees: {round_trip_fee * 100:.2f}% round-trip > {MAX_ROUND_TRIP_FEE_PCT * 100:.2f}%"
+            logger.error("%s. Pausing.", msg)
             db.update_bot_state(status="PAUSED")
+            telegram.notify_paused(msg)
             return
 
         # Discover markets + subscribe
@@ -709,7 +714,10 @@ class TradingBot:
 
         self._check_level_up()
         self._sync_state()
-        supabase_push.sync_unsynced_trades(db)
+        telegram.notify_trade_exit(
+            asset, direction, exit_reason, net_pnl, self.balance,
+            "WIN" if is_win else "LOSS",
+        )
 
         logger.info(
             "EXIT: %s | Gross: $%+.2f | Fees: $%.2f | Net: $%+.2f (%.1f%%) | Balance: $%.2f | Hold: %ds",
@@ -719,6 +727,7 @@ class TradingBot:
     def _check_risk_limits(self) -> Optional[str]:
         if self.balance < float(MIN_BET):
             db.update_bot_state(status="BLOWN_UP")
+            telegram.notify_paused(f"Balance ${self.balance:.2f} below minimum bet")
             return f"Balance ${self.balance:.2f} below minimum bet"
 
         if self.consecutive_losses >= CONSECUTIVE_LOSS_PAUSE:
@@ -745,7 +754,8 @@ class TradingBot:
         if idx < len(LEVEL_TARGETS) and self.balance >= LEVEL_TARGETS[idx]:
             hours = (time.time() - self.start_time) / 3600
             logger.info("LEVEL UP! Level %d ($%.2f) in %.1fh", self.current_level, self.balance, hours)
-            supabase_push.push_level_reached(self.current_level, LEVEL_TARGETS[idx], self.total_trades, hours)
+            db_sync.push_level_reached(self.current_level, LEVEL_TARGETS[idx], self.total_trades, hours)
+            telegram.notify_level_up(self.current_level, self.balance, hours)
             self.current_level += 1
             self.level_target = LEVEL_TARGETS[self.current_level - 1] if self.current_level <= len(LEVEL_TARGETS) else 99999
             db.update_bot_state(current_level=self.current_level, level_target=self.level_target)
@@ -753,15 +763,22 @@ class TradingBot:
     def _sync_state(self):
         win_rate = self.total_wins / self.total_trades if self.total_trades > 0 else 0
         phase, _ = calculate_phase_and_bet(self.balance, INITIAL_BANKROLL)
-        supabase_push.push_bot_state(
-            status="RUNNING", balance=self.balance, level=self.current_level,
-            level_target=self.level_target, peak=self.peak_balance,
+        state = db.get_bot_state()
+        db.sync_bot_state(
+            status=state.get("status", "RUNNING"),
+            balance=self.balance,
+            level=self.current_level,
+            level_target=self.level_target,
+            peak=self.peak_balance,
             today_start=db.get_today_starting_balance(),
-            total_trades=self.total_trades, total_wins=self.total_wins,
-            win_rate=win_rate, brier_score=0,
-            regime=db.get_bot_state().get("current_regime", "UNKNOWN"),
+            total_trades=self.total_trades,
+            total_wins=self.total_wins,
+            win_rate=win_rate,
+            brier_score=0,
+            regime=state.get("current_regime", "UNKNOWN"),
             kelly_alpha=DEFAULT_KELLY_FRACTION,
-            consecutive_losses=self.consecutive_losses, current_phase=phase,
+            consecutive_losses=self.consecutive_losses,
+            current_phase=phase,
         )
 
     def _handle_command(self, cmd: dict):
@@ -769,8 +786,10 @@ class TradingBot:
         logger.info("Admin command: %s", command)
         if command == "PAUSE":
             db.update_bot_state(status="PAUSED")
+            telegram.notify_paused("Admin command: PAUSE")
         elif command == "RESUME":
             db.update_bot_state(status="RUNNING")
+            telegram.send_message("▶️ <b>Bot resumed</b> (admin command)")
         elif command == "FORCE_SKIP":
             logger.info("Force skip next window")
 

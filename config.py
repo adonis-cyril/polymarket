@@ -31,13 +31,12 @@ RELAYER_API_KEY_ADDRESS = os.getenv("RELAYER_API_KEY_ADDRESS", "")
 POLY_CLOB_URL = "https://clob.polymarket.com"
 POLY_CHAIN_ID = 137  # Polygon mainnet
 
-# Supabase
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+# PostgreSQL
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# Gmail
-GMAIL_ADDRESS = os.getenv("GMAIL_ADDRESS", "")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+# Telegram notifications
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Bot config
 STARTING_BANKROLL = Decimal(os.getenv("STARTING_BANKROLL", "20.00"))

@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { Trade } from "@/lib/types";
 
 interface AssetStats {
@@ -19,22 +18,25 @@ const ASSET_COLORS: Record<string, string> = {
   xrp: "bg-gray-400",
 };
 
+const POLL_MS = 4000;
+
 export default function AssetBreakdown() {
   const [stats, setStats] = useState<AssetStats[]>([]);
 
   useEffect(() => {
     async function load() {
-      const { data: trades } = await supabase.from("trades").select("asset, result, pnl");
-      if (!trades) return;
+      const res = await fetch("/api/trades?limit=500");
+      if (!res.ok) return;
 
+      const trades = (await res.json()) as Pick<Trade, "asset" | "result" | "pnl">[];
       const byAsset: Record<string, AssetStats> = {};
-      for (const t of trades as Pick<Trade, "asset" | "result" | "pnl">[]) {
+      for (const t of trades) {
         if (!byAsset[t.asset]) {
           byAsset[t.asset] = { asset: t.asset, trades: 0, wins: 0, winRate: 0, pnl: 0 };
         }
         byAsset[t.asset].trades++;
         if (t.result === "WIN") byAsset[t.asset].wins++;
-        byAsset[t.asset].pnl += t.pnl ?? 0;
+        byAsset[t.asset].pnl += Number(t.pnl ?? 0);
       }
 
       const result = Object.values(byAsset).map((s) => ({
@@ -46,13 +48,8 @@ export default function AssetBreakdown() {
     }
 
     load();
-
-    const channel = supabase
-      .channel("asset_breakdown")
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "trades" }, () => load())
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   const maxPnl = Math.max(...stats.map((s) => Math.abs(s.pnl)), 1);

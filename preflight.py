@@ -60,8 +60,7 @@ def check_env_vars():
 
     placeholders = ("...", "your-anon-key-here", "0x...")
     configured = []
-    for var in ("SUPABASE_URL", "SUPABASE_KEY",
-                "GMAIL_ADDRESS"):
+    for var in ("DATABASE_URL", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"):
         val = os.getenv(var, "")
         if val and val not in placeholders:
             configured.append(var.split("_")[0].lower())
@@ -83,6 +82,7 @@ def check_dependencies():
         ("requests", "requests"),
         ("dotenv", "python-dotenv"),
         ("aiohttp", "aiohttp"),
+        ("psycopg2", "psycopg2-binary"),
     ]
 
     missing = []
@@ -92,10 +92,8 @@ def check_dependencies():
         except ImportError:
             missing.append(pkg_name)
 
-    # Optional deps
     optional_missing = []
     optional = [
-        ("supabase", "supabase"),
         ("py_clob_client", "py-clob-client"),
         ("web3", "web3"),
     ]
@@ -120,21 +118,30 @@ def check_dependencies():
 
 
 def check_database():
-    """Check 3: SQLite database initializes and works."""
+    """Check 3: PostgreSQL initializes and works."""
+    from data.pg import get_database_url
+
+    if not get_database_url():
+        return CheckResult(
+            "PostgreSQL database",
+            FAIL,
+            "DATABASE_URL or PG_* vars not configured",
+        )
+
     try:
         from data import db
         db.init_db()
         state = db.get_bot_state()
         return CheckResult(
-            "SQLite database",
+            "PostgreSQL database",
             PASS,
-            f"Tables OK, state has {len(state)} fields",
+            f"Connected, bot_state has {len(state)} fields",
         )
     except Exception as e:
         return CheckResult(
-            "SQLite database",
+            "PostgreSQL database",
             FAIL,
-            f"init_db() failed: {e}",
+            f"Connection failed: {e}",
         )
 
 
@@ -155,7 +162,6 @@ async def check_binance_ws():
                 "Failed to connect — check network/firewall",
             )
 
-        # Wait for price data (up to 10s)
         deadline = time.time() + 10
         while time.time() < deadline:
             prices = ws.get_all_prices()
@@ -283,36 +289,38 @@ def check_signal_pipeline():
         )
 
 
-def check_supabase():
-    """Check 8: Supabase client connects."""
-    from config import SUPABASE_URL, SUPABASE_KEY
+def check_telegram():
+    """Check 8: Telegram bot credentials configured."""
+    from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-    if not SUPABASE_URL or not SUPABASE_KEY:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return CheckResult(
-            "Supabase sync",
+            "Telegram notifications",
             SKIP,
-            "Credentials not configured (optional)",
+            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured (optional)",
         )
 
     try:
-        from supabase import create_client
-        client = create_client(SUPABASE_URL, SUPABASE_KEY)
-        # Try a lightweight query
-        client.table("bot_state").select("*").limit(1).execute()
-        return CheckResult(
-            "Supabase sync",
-            PASS,
-            "Connected, bot_state table accessible",
+        import requests
+        resp = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe",
+            timeout=10,
         )
-    except ImportError:
+        if resp.ok:
+            username = resp.json().get("result", {}).get("username", "unknown")
+            return CheckResult(
+                "Telegram notifications",
+                PASS,
+                f"Bot @{username} reachable",
+            )
         return CheckResult(
-            "Supabase sync",
-            SKIP,
-            "supabase package not installed",
+            "Telegram notifications",
+            FAIL,
+            f"API error: {resp.text[:80]}",
         )
     except Exception as e:
         return CheckResult(
-            "Supabase sync",
+            "Telegram notifications",
             FAIL,
             f"Connection failed: {e}",
         )
@@ -330,7 +338,6 @@ def check_clob_auth():
         )
 
     try:
-        # Reset singleton so we test fresh initialization
         import execution.order as order_mod
         order_mod._client = None
 
@@ -368,29 +375,20 @@ async def run_preflight(live_mode: bool):
 
     results = []
 
-    # Sync checks (1-3)
     results.append(check_env_vars())
     results.append(check_dependencies())
     results.append(check_database())
 
-    # Async checks (4, 6) in parallel
     binance_result, poly_ws_result = await asyncio.gather(
         check_binance_ws(),
         check_polymarket_ws(),
     )
     results.append(binance_result)
 
-    # Sync check (5)
     results.append(check_market_discovery())
-
-    # Polymarket WS result
     results.append(poly_ws_result)
-
-    # Sync check (7)
     results.append(check_signal_pipeline())
-
-    # Conditional checks (8-9)
-    results.append(check_supabase())
+    results.append(check_telegram())
 
     if live_mode:
         results.append(check_clob_auth())
@@ -401,7 +399,6 @@ async def run_preflight(live_mode: bool):
             "Run with --live to test",
         ))
 
-    # Print results
     for r in results:
         print(f"  {r.status} {r.name:<26s} {r.detail}")
 

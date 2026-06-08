@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { BotState } from "@/lib/types";
 
 const REGIME_CONFIG: Record<string, { color: string; label: string; action: string }> = {
@@ -12,37 +11,26 @@ const REGIME_CONFIG: Record<string, { color: string; label: string; action: stri
   UNKNOWN: { color: "bg-gray-500", label: "Unknown", action: "Initializing..." },
 };
 
+const POLL_MS = 4000;
+
 export default function RegimeIndicator() {
   const [regime, setRegime] = useState("UNKNOWN");
   const [status, setStatus] = useState("STOPPED");
 
   useEffect(() => {
-    supabase
-      .from("bot_state")
-      .select("current_regime, status")
-      .eq("id", 1)
-      .single()
-      .then(({ data }) => {
-        if (data) {
-          setRegime(data.current_regime ?? "UNKNOWN");
-          setStatus(data.status ?? "STOPPED");
-        }
-      });
+    async function load() {
+      const res = await fetch("/api/bot-state");
+      if (!res.ok) return;
+      const data = (await res.json()) as BotState;
+      if (data) {
+        setRegime(data.current_regime ?? "UNKNOWN");
+        setStatus(data.status ?? "STOPPED");
+      }
+    }
 
-    const channel = supabase
-      .channel("regime_indicator")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "bot_state" },
-        (payload) => {
-          const s = payload.new as BotState;
-          setRegime(s.current_regime ?? "UNKNOWN");
-          setStatus(s.status ?? "STOPPED");
-        }
-      )
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
+    load();
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   const config = REGIME_CONFIG[regime] ?? REGIME_CONFIG.UNKNOWN;

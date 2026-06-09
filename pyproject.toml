@@ -1,0 +1,54 @@
+[project]
+name = "polymarket"
+version = "0.1.0"
+description = "Polymarket 5-min trading bot with terminal workstation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "requests>=2.31.0",
+    "psycopg2-binary>=2.9.0",
+    "web3>=6.0.0",
+    "py-clob-client>=0.1.0",
+    "py-clob-client-v2>=1.0.1",
+    "python-dotenv>=1.0.0",
+    "aiohttp>=3.9.0",
+    "polymarket-client",
+    # TUI stack
+    "textual>=1.0.0",
+    "rich>=13.7.0",
+    "prompt-toolkit>=3.0.43",
+    "pandas>=2.2.0",
+    "plotext>=5.2.8",
+    "loguru>=0.7.2",
+    "pydantic>=2.6.0",
+    "pydantic-settings>=2.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "mypy>=1.8.0",
+    "ruff>=0.3.0",
+]
+
+[project.scripts]
+polymarket = "start:main"
+polymarket-tui = "start:main"
+start = "start:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["terminal"]
+py-modules = ["start"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true

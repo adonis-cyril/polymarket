@@ -5,6 +5,9 @@ data/cache/
 *.egg-info/
 .venv/
 
+# TUI
+.tui_history
+
 # Logs
 logs
 *.log

@@ -52,7 +52,8 @@ The bot can re-enter the same window up to 3 times if time and risk limits allow
 ## Project structure
 
 ```
-bot.py                  Entry point (paper by default, --live for CLOB orders)
+start.py                Primary entry — password gate + TUI workstation
+bot.py                  Direct bot entry (paper by default, --live for CLOB orders)
 config.py               Assets, bankroll limits, API credentials
 preflight.py            Pre-run checks for env, deps, WS, PostgreSQL, Telegram, CLOB
 
@@ -253,7 +254,18 @@ brew services start postgresql@16
 
 Ensure `postgresql@16` is running before `python preflight.py`. If tables were created as your macOS user, re-run `./scripts/setup_postgres_local.sh` (it assigns ownership to `polymarket`) or connect with the same role that ran `init_db.sql`.
 
-### Python bot
+### Primary workflow (TUI workstation)
+
+```bash
+uv sync
+cp .env.example .env   # set DATABASE_URL, ADMIN_PASSWORD, etc.
+uv run python start.py # password gate → Hummingbot-style 2-pane trading console
+# or: uv run polymarket
+```
+
+The TUI provides a keyboard-first 2-pane layout: left pane (markets/positions/bot status), right activity console (trades, logs, commands), and a `>>>` command bar (`buy`, `sell`, `cancel`, `refresh`, `positions`, `markets`, `help`, `quit`). Extended screens via `screen bot|tests|settings`. See `terminal/README.md` and `terminal/ARCHITECTURE.md`.
+
+### Python bot (direct CLI)
 
 ```bash
 python3.12 -m venv .venv
@@ -266,6 +278,16 @@ python bot.py --live   # live CLOB execution
 python bot.py --hft    # HFT scalp mode (paper; set BOT_MODE=hft in .env)
 python bot.py --hft --live
 ```
+
+Or with **uv**:
+
+```bash
+uv sync
+uv run python preflight.py
+uv run python bot.py
+```
+
+You can also start the bot from the TUI (`screen bot` or `bot start paper|live`).
 
 **Before live trading**, run [operational checks](#operational-checks) (`preflight.py` and `scripts/check_status.py`).
 

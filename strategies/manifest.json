@@ -1,0 +1,20 @@
+{
+  "strategies": [
+    {
+      "name": "kelly",
+      "aliases": ["staircase_kelly", "standard"],
+      "description": "Quarter-Kelly sizing with active mid-window exits and staircase level-ups",
+      "bot_mode": "standard",
+      "default_mode": "paper",
+      "extra_args": []
+    },
+    {
+      "name": "hft",
+      "aliases": [],
+      "description": "HFT scalp mode — 2% take-profit, 1.5% stop-loss, max 30s hold",
+      "bot_mode": "hft",
+      "default_mode": "paper",
+      "extra_args": ["--hft"]
+    }
+  ]
+}

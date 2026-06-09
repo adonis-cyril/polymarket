@@ -19,9 +19,20 @@ from typing import Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from utils.polymarket_connectivity import (
+    check_polymarket_connectivity,
+    clob_get,
+    get_ws_headers,
+    install_dns_patch,
+    ws_connect_header_kwargs,
+)
+
 logger = logging.getLogger(__name__)
 
 CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+WS_OPEN_TIMEOUT = 30.0
+WS_INITIAL_CONNECT_TIMEOUT = 20.0
+PING_INTERVAL_SECONDS = 10.0
 
 
 @dataclass
@@ -97,20 +108,22 @@ class PolymarketWebsocket:
         self._subscribed_tokens: set[str] = set()
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._ping_task: Optional[asyncio.Task] = None
         self._ws = None
         self._connected = asyncio.Event()
+        self._subscription_needed = asyncio.Event()
+        self._ws_subscribed = False
         self._reconnect_delay = 1.0
+        self._unreachable_logged = False
+        self._use_rest_fallback = False
+        install_dns_patch()
 
     async def start(self):
-        """Start the websocket connection."""
+        """Start the websocket background task (connects on first subscribe)."""
         if self._running:
             return
         self._running = True
         self._task = asyncio.create_task(self._run_forever())
-        try:
-            await asyncio.wait_for(self._connected.wait(), timeout=10.0)
-        except asyncio.TimeoutError:
-            logger.warning("Polymarket WS initial connection timed out")
 
     async def stop(self):
         """Stop the websocket connection."""
@@ -127,6 +140,44 @@ class PolymarketWebsocket:
     def is_connected(self) -> bool:
         return self._connected.is_set()
 
+    def using_rest_fallback(self) -> bool:
+        return self._use_rest_fallback and not self.is_connected()
+
+    async def refresh_books_rest(self, *token_ids: str) -> int:
+        """Fetch order books via CLOB REST when WS is unavailable."""
+        updated = 0
+        for token_id in token_ids:
+            book = self._fetch_order_book_rest(token_id)
+            if book:
+                self._books[token_id] = book
+                updated += 1
+        if updated and not self.is_connected():
+            self._use_rest_fallback = True
+        return updated
+
+    def _fetch_order_book_rest(self, token_id: str) -> Optional[OrderBookSnapshot]:
+        try:
+            resp = clob_get("/book", params={"token_id": token_id})
+            if not resp.ok:
+                return None
+            data = resp.json()
+            book = OrderBookSnapshot(token_id=token_id)
+            book.bids = [
+                OrderBookLevel(price=float(b["price"]), size=float(b["size"]))
+                for b in data.get("bids", [])
+            ]
+            book.asks = [
+                OrderBookLevel(price=float(a["price"]), size=float(a["size"]))
+                for a in data.get("asks", [])
+            ]
+            book.bids.sort(key=lambda level: level.price, reverse=True)
+            book.asks.sort(key=lambda level: level.price)
+            book.last_update = time.time()
+            return book
+        except Exception as exc:
+            logger.debug("REST order book fetch failed for %s: %s", token_id[:10], exc)
+            return None
+
     async def subscribe(self, *token_ids: str):
         """Subscribe to order book updates for given token IDs."""
         new_tokens = set(token_ids) - self._subscribed_tokens
@@ -137,23 +188,31 @@ class PolymarketWebsocket:
             self._books[token_id] = OrderBookSnapshot(token_id=token_id)
             self._subscribed_tokens.add(token_id)
 
-        if self._ws:
-            for token_id in new_tokens:
-                msg = {
-                    "type": "market",
-                    "assets_ids": [token_id],
-                }
-                try:
-                    await self._ws.send(json.dumps(msg))
-                    logger.debug("Subscribed to token %s", token_id[:10])
-                except Exception as e:
-                    logger.error("Failed to subscribe to %s: %s", token_id[:10], e)
+        self._subscription_needed.set()
+
+        if self._ws and self._connected.is_set():
+            await self._send_subscription(self._ws, new_tokens, initial=not self._ws_subscribed)
+        elif not self.is_connected():
+            try:
+                await asyncio.wait_for(
+                    self._connected.wait(), timeout=WS_INITIAL_CONNECT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                self._use_rest_fallback = True
+                if not self._unreachable_logged:
+                    status = check_polymarket_connectivity()
+                    logger.warning(
+                        "Polymarket CLOB WS connection timed out after subscribe. %s",
+                        status.get("action", "REST fallback available."),
+                    )
+                    self._unreachable_logged = True
 
     async def unsubscribe_all(self):
-        """Unsubscribe from all tokens."""
+        """Clear local book/trade cache and drop subscriptions until next cycle."""
         self._subscribed_tokens.clear()
         self._books.clear()
         self._recent_trades.clear()
+        self._subscription_needed.clear()
 
     # ----- Public data accessors -----
 
@@ -203,32 +262,83 @@ class PolymarketWebsocket:
 
     # ----- Internal websocket management -----
 
+    async def _send_subscription(
+        self, ws, token_ids: set[str], *, initial: bool,
+    ) -> None:
+        """Send initial or dynamic subscription for token IDs."""
+        if not token_ids:
+            return
+        if initial:
+            msg = {
+                "type": "market",
+                "assets_ids": list(token_ids),
+                "custom_feature_enabled": True,
+            }
+            self._ws_subscribed = True
+        else:
+            msg = {
+                "assets_ids": list(token_ids),
+                "operation": "subscribe",
+                "custom_feature_enabled": True,
+            }
+        await ws.send(json.dumps(msg))
+        logger.debug(
+            "Subscribed to %d token(s)%s",
+            len(token_ids),
+            " (initial)" if initial else "",
+        )
+
     async def _run_forever(self):
-        """Main loop: connect, receive messages, reconnect on failure."""
+        """Main loop: connect when tokens exist, receive messages, reconnect on failure."""
         while self._running:
+            if not self._subscribed_tokens:
+                self._connected.clear()
+                self._ws = None
+                self._ws_subscribed = False
+                try:
+                    await asyncio.wait_for(self._subscription_needed.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+                self._subscription_needed.clear()
+                continue
+
+            tokens_snapshot = set(self._subscribed_tokens)
             try:
                 logger.info("Connecting to Polymarket CLOB WS...")
                 async with websockets.connect(
                     CLOB_WS_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    open_timeout=WS_OPEN_TIMEOUT,
+                    **ws_connect_header_kwargs(get_ws_headers()),
                 ) as ws:
                     self._ws = ws
-                    self._connected.set()
-                    self._reconnect_delay = 1.0
-                    logger.info("Polymarket CLOB WS connected")
+                    self._ws_subscribed = False
+                    tokens = set(self._subscribed_tokens)
+                    if not tokens:
+                        continue
+                    await self._send_subscription(ws, tokens, initial=True)
+                    extra = self._subscribed_tokens - tokens
+                    if extra:
+                        await self._send_subscription(ws, extra, initial=False)
 
-                    # Re-subscribe to any tokens
-                    for token_id in self._subscribed_tokens:
-                        msg = {"type": "market", "assets_ids": [token_id]}
-                        await ws.send(json.dumps(msg))
+                    self._connected.set()
+                    self._use_rest_fallback = False
+                    self._reconnect_delay = 1.0
+                    logger.info(
+                        "Polymarket CLOB WS connected (%d token(s))",
+                        len(self._subscribed_tokens),
+                    )
+
+                    self._ping_task = asyncio.create_task(self._ping_loop(ws))
 
                     async for raw_msg in ws:
                         if not self._running:
                             break
+                        if raw_msg == "PONG":
+                            continue
                         try:
                             parsed = json.loads(raw_msg)
-                            # Polymarket can send arrays of messages
                             if isinstance(parsed, list):
                                 for item in parsed:
                                     if isinstance(item, dict):
@@ -236,22 +346,49 @@ class PolymarketWebsocket:
                             elif isinstance(parsed, dict):
                                 self._handle_message(parsed)
                         except json.JSONDecodeError:
-                            pass  # Ignore non-JSON messages (pings, etc.)
+                            pass
                         except Exception:
                             logger.exception("Error handling Polymarket WS message")
 
             except ConnectionClosed as e:
                 logger.warning("Polymarket WS closed: %s", e)
-            except Exception:
-                logger.exception("Polymarket WS connection error")
+            except Exception as e:
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.exception("Polymarket WS connection error")
+                else:
+                    logger.warning("Polymarket WS connection error: %s", e)
+
+            if self._ping_task:
+                self._ping_task.cancel()
+                try:
+                    await self._ping_task
+                except asyncio.CancelledError:
+                    pass
+                self._ping_task = None
 
             self._ws = None
+            self._ws_subscribed = False
             self._connected.clear()
+            self._use_rest_fallback = True
 
-            if self._running:
-                logger.info("Reconnecting in %.1fs...", self._reconnect_delay)
-                await asyncio.sleep(self._reconnect_delay)
-                self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+            if not self._running:
+                break
+            if not self._subscribed_tokens:
+                continue
+            logger.info("Reconnecting in %.1fs...", self._reconnect_delay)
+            await asyncio.sleep(self._reconnect_delay)
+            self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
+
+    async def _ping_loop(self, ws):
+        """Application-level PING required by Polymarket WS (every 10s)."""
+        try:
+            while self._running and self._connected.is_set():
+                await asyncio.sleep(PING_INTERVAL_SECONDS)
+                await ws.send("PING")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Polymarket WS ping loop stopped: %s", exc)
 
     def _handle_message(self, msg: dict):
         """Route message to appropriate handler."""

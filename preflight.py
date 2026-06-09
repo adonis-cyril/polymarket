@@ -200,15 +200,77 @@ async def check_binance_ws():
         )
 
 
+def check_active_markets_cache():
+    """Check optional full-market registry cache."""
+    try:
+        from config import ACTIVE_MARKETS_CACHE_ENABLED, ACTIVE_MARKETS_DB_PERSIST
+        if not ACTIVE_MARKETS_CACHE_ENABLED:
+            return CheckResult(
+                "Active markets cache",
+                SKIP,
+                "ACTIVE_MARKETS_CACHE_ENABLED=false",
+            )
+
+        from data.market_registry import get_cache_status
+
+        status = get_cache_status()
+        try:
+            import execution.active_markets  # noqa: F401
+            fetcher = "available"
+        except ImportError:
+            fetcher = "missing (execution.active_markets)"
+
+        if not ACTIVE_MARKETS_DB_PERSIST:
+            return CheckResult(
+                "Active markets cache",
+                PASS,
+                f"In-memory only, fetcher {fetcher}",
+            )
+
+        count = status.get("db_active_count")
+        last_sync = status.get("last_full_sync_at")
+        if count:
+            return CheckResult(
+                "Active markets cache",
+                PASS,
+                f"{count} cached markets, last sync {last_sync}, fetcher {fetcher}",
+            )
+
+        return CheckResult(
+            "Active markets cache",
+            PASS,
+            f"No cached markets yet — run scripts/refresh_markets.py (fetcher {fetcher})",
+        )
+    except Exception as e:
+        return CheckResult(
+            "Active markets cache",
+            FAIL,
+            f"Error: {e}",
+        )
+
+
 def check_market_discovery():
     """Check 5: Polymarket Gamma API returns markets."""
     try:
         from execution.market_discovery import (
-            discover_all_markets, seconds_until_close,
+            discover_all_markets,
+            get_last_discovery_error,
+            seconds_until_close,
+            was_last_discovery_unreachable,
         )
+        from utils.polymarket_connectivity import check_polymarket_connectivity
 
+        status = check_polymarket_connectivity()
         markets = discover_all_markets()
         remaining = seconds_until_close()
+
+        if was_last_discovery_unreachable():
+            return CheckResult(
+                "Market discovery",
+                FAIL,
+                f"Gamma API unreachable — {get_last_discovery_error() or status['gamma_detail']}. "
+                f"{status['action']}",
+            )
 
         if not markets:
             return CheckResult(
@@ -221,11 +283,16 @@ def check_market_discovery():
         names = ", ".join(
             f"{m.asset.upper()}" for m in markets.values()
         )
+        detail = (
+            f"Found {len(markets)} markets: {names} "
+            f"({remaining:.0f}s left)"
+        )
+        if status.get("dns_auto_fixed"):
+            detail += " [DNS auto-bypass active]"
         return CheckResult(
             "Market discovery",
             PASS,
-            f"Found {len(markets)} markets: {names} "
-            f"({remaining:.0f}s left)",
+            detail,
         )
     except Exception as e:
         return CheckResult(
@@ -236,26 +303,73 @@ def check_market_discovery():
 
 
 async def check_polymarket_ws():
-    """Check 6: Polymarket CLOB WebSocket connects."""
+    """Check 6: Polymarket CLOB WebSocket connects and stays stable."""
     try:
         from data.polymarket_ws import PolymarketWebsocket
+        from utils.polymarket_connectivity import check_polymarket_connectivity, clob_get
+
+        status = check_polymarket_connectivity()
+
+        token_id = None
+        try:
+            resp = clob_get("/sampling-markets", params={"limit": 5})
+            if resp.ok:
+                payload = resp.json()
+                markets = payload if isinstance(payload, list) else payload.get("data", [])
+                for market in markets:
+                    for token in market.get("tokens", []):
+                        token_id = token.get("token_id")
+                        if token_id:
+                            break
+                    if token_id:
+                        break
+        except Exception:
+            pass
 
         ws = PolymarketWebsocket()
         await ws.start()
+        if not token_id:
+            await ws.stop()
+            return CheckResult(
+                "CLOB WebSocket",
+                FAIL,
+                "Could not find an active CLOB token for WS subscription test",
+            )
+
+        await ws.subscribe(token_id)
 
         connected = ws.is_connected()
+        if connected:
+            await asyncio.sleep(5)
+            connected = ws.is_connected()
+
+        book = ws.get_order_book(token_id) if token_id and connected else None
+        has_book = bool(
+            book and (book.bids or book.asks) and book.best_bid > 0 and book.best_ask < 1,
+        )
         await ws.stop()
 
         if connected:
+            detail = "Connected to Polymarket CLOB WS (stable >5s)"
+            if has_book:
+                detail += f", book bid={book.best_bid:.3f} ask={book.best_ask:.3f}"
+            elif token_id:
+                detail += ", awaiting book snapshot"
+            if status.get("dns_auto_fixed"):
+                detail += " [DNS auto-bypass active]"
+            return CheckResult("CLOB WebSocket", PASS, detail)
+
+        if status.get("gamma_ok") and status.get("dns_auto_fixed"):
             return CheckResult(
                 "CLOB WebSocket",
-                PASS,
-                "Connected to Polymarket CLOB WS",
+                FAIL,
+                "WS timed out but Gamma REST works — retry or use REST fallback in paper mode",
             )
+
         return CheckResult(
             "CLOB WebSocket",
             FAIL,
-            "Connection timed out",
+            f"Connection timed out. {status.get('action', '')}",
         )
     except Exception as e:
         return CheckResult(
@@ -386,6 +500,7 @@ async def run_preflight(live_mode: bool):
     results.append(binance_result)
 
     results.append(check_market_discovery())
+    results.append(check_active_markets_cache())
     results.append(poly_ws_result)
     results.append(check_signal_pipeline())
     results.append(check_telegram())

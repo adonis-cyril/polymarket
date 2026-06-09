@@ -214,12 +214,22 @@ def sync_bot_state(
         )
 
 
+_FLOAT_STATE_FIELDS = (
+    "current_balance", "level_target", "peak_balance",
+    "today_starting_balance", "win_rate", "brier_score", "kelly_alpha",
+)
+
+
 def get_bot_state() -> dict:
     with get_connection() as conn:
         cur = dict_cursor(conn)
         cur.execute("SELECT * FROM bot_state WHERE id = 1")
         row = cur.fetchone()
-    return dict(row) if row else {}
+    state = dict(row) if row else {}
+    for field in _FLOAT_STATE_FIELDS:
+        if field in state and state[field] is not None:
+            state[field] = float(state[field])
+    return state
 
 
 def save_window_open_price(asset: str, window_ts: int, open_price: float):

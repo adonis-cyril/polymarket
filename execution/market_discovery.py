@@ -18,9 +18,16 @@ from typing import Optional
 
 import requests
 
+from utils.polymarket_connectivity import (
+    check_polymarket_connectivity,
+    gamma_get,
+)
+
 logger = logging.getLogger(__name__)
 
 GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+_last_fetch_error: Optional[str] = None
+_last_fetch_unreachable = False
 
 ASSET_SLUGS = {
     "btc": "btc-updown-5m",
@@ -29,7 +36,13 @@ ASSET_SLUGS = {
     "xrp": "xrp-updown-5m",
 }
 
-REQUEST_TIMEOUT = 10
+
+def get_last_discovery_error() -> Optional[str]:
+    return _last_fetch_error
+
+
+def was_last_discovery_unreachable() -> bool:
+    return _last_fetch_unreachable
 
 
 @dataclass
@@ -67,18 +80,30 @@ def seconds_until_close() -> float:
 
 def fetch_market_by_slug(slug: str) -> Optional[dict]:
     """Fetch a single market event from Gamma API by slug."""
+    global _last_fetch_error, _last_fetch_unreachable
+
     try:
-        resp = requests.get(
-            f"{GAMMA_API_BASE}/events",
-            params={"slug": slug},
-            timeout=REQUEST_TIMEOUT,
-        )
+        resp = gamma_get("/events", params={"slug": slug})
         resp.raise_for_status()
+        _last_fetch_error = None
+        _last_fetch_unreachable = False
         data = resp.json()
         if isinstance(data, list) and data:
             return data[0]
         return None
+    except requests.Timeout as e:
+        _last_fetch_unreachable = True
+        _last_fetch_error = str(e)
+        logger.warning("Gamma API timeout for %s: %s", slug, e)
+        return None
+    except requests.ConnectionError as e:
+        _last_fetch_unreachable = True
+        _last_fetch_error = str(e)
+        logger.warning("Gamma API connection failed for %s: %s", slug, e)
+        return None
     except requests.RequestException as e:
+        _last_fetch_error = str(e)
+        _last_fetch_unreachable = False
         logger.error("Failed to fetch market %s: %s", slug, e)
         return None
 
@@ -156,10 +181,24 @@ def discover_all_markets(window_ts: Optional[int] = None) -> dict[str, Market]:
         if market:
             markets[asset] = market
 
-    logger.info(
-        "Discovered %d/%d markets for window %d",
-        len(markets), len(ASSET_SLUGS), window_ts,
-    )
+    if not markets and was_last_discovery_unreachable():
+        status = check_polymarket_connectivity()
+        logger.error(
+            "Discovered 0/%d markets — Polymarket unreachable (%s). %s",
+            len(ASSETS),
+            get_last_discovery_error() or status.get("gamma_detail", "unknown"),
+            status.get("action", ""),
+        )
+    elif not markets:
+        logger.warning(
+            "Discovered 0/%d markets for window %d (API reachable, no active slugs)",
+            len(ASSETS), window_ts,
+        )
+    else:
+        logger.info(
+            "Discovered %d/%d markets for window %d",
+            len(markets), len(ASSETS), window_ts,
+        )
     return markets
 
 
@@ -170,10 +209,9 @@ def get_market_prices(condition_id: str) -> Optional[dict]:
     Returns dict with 'up_price' and 'down_price' or None.
     """
     try:
-        resp = requests.get(
-            f"{GAMMA_API_BASE}/markets",
+        resp = gamma_get(
+            "/markets",
             params={"condition_id": condition_id},
-            timeout=REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
         data = resp.json()

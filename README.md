@@ -108,6 +108,7 @@ utils/
 
 scripts/
   check_status.py           Connection & wallet status report
+  check_binance.py          Binance REST + live OHLCV feed check
   setup_postgres_local.sh   Homebrew PostgreSQL 16 setup (macOS)
   refresh_markets.py        Active-market registry refresh / query
   fetch_active_markets.py   Gamma fetch → JSON cache
@@ -391,6 +392,20 @@ python scripts/check_status.py --dns-only
 **Account (CLOB wallet)** — when `POLY_PRIVATE_KEY` is set: funder vs signer addresses, signature type mapping, derived API credentials, tradable USDC balance, open position count and mark-to-market value from the Data API, plus hints when balance is $0 or position data looks stale.
 
 Ends with a summary verdict: `ALL CLEAR`, `OK WITH WARNINGS`, or `ISSUES FOUND`. Exit code `1` if any check failed.
+
+### Binance market data (`scripts/check_binance.py`)
+
+Checks Binance public REST and WebSocket feeds for BTC, ETH, and SOL (independent of `config.ASSETS`). Useful before live runs when price/candle data must be healthy.
+
+```bash
+python scripts/check_binance.py
+python scripts/check_binance.py --quick
+python scripts/check_binance.py --assets btc,eth,sol
+```
+
+**REST** — `/api/v3/klines` (last 5 closed 1m candles + latest OHLCV) and `/api/v3/ticker/price` per asset.
+
+**WebSocket** — combined `miniTicker` + `kline_1m` stream via `BinanceWebsocket`; verifies live price updates within ~10s and at least one closed 1m candle in the buffer (REST-seeded counts). Skipped with `--quick`. No API key required.
 
 ## Order execution & deposit wallets
 

@@ -12,21 +12,58 @@ import time
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
 
+from config import POLY_FUNDER_ADDRESS, POLY_SIGNATURE_TYPE
 from execution.order import get_clob_client
 
 logger = logging.getLogger(__name__)
 
+DATA_API_BASE = "https://data-api.polymarket.com"
 POLL_INTERVAL = 2.0
 MAX_POLL_SECONDS = 30.0
 
 
-def get_usdc_balance() -> float:
-    """Get current USDC balance from the CLOB API."""
+def get_positions_address() -> str:
+    """Address Polymarket indexes for portfolio value and open positions."""
+    return POLY_FUNDER_ADDRESS or ""
+
+
+def get_position_value_usd(address: str | None = None) -> float | None:
+    """Open position mark-to-market via data-api /value (excludes CLOB cash)."""
+    addr = address or get_positions_address()
+    if not addr:
+        return None
+    try:
+        from utils.polymarket_connectivity import create_requests_session, install_dns_patch
+
+        install_dns_patch()
+        resp = create_requests_session().get(
+            f"{DATA_API_BASE}/value",
+            params={"user": addr},
+            timeout=20,
+        )
+        if not resp.ok:
+            return None
+        payload = resp.json()
+        if isinstance(payload, list) and payload:
+            return float(payload[0].get("value", 0) or 0)
+    except Exception as exc:
+        logger.warning("Failed to query position value: %s", exc)
+    return None
+
+
+def get_usdc_balance(*, sync: bool = True) -> float:
+    """Get current USDC collateral balance from the CLOB API."""
     try:
         client = get_clob_client()
         params = BalanceAllowanceParams(
             asset_type=AssetType.COLLATERAL,
+            signature_type=POLY_SIGNATURE_TYPE,
         )
+        if sync and hasattr(client, "update_balance_allowance"):
+            try:
+                client.update_balance_allowance(params)
+            except Exception as exc:
+                logger.debug("Balance sync skipped: %s", exc)
         balance_info = client.get_balance_allowance(params)
         if isinstance(balance_info, dict):
             balance_str = balance_info.get("balance", "0")
@@ -76,11 +113,23 @@ def wait_for_balance_update(
 
 
 def get_positions() -> list[dict]:
-    """Get current open positions."""
+    """Get current open positions from Polymarket data-api (indexed by funder)."""
+    addr = get_positions_address()
+    if not addr:
+        return []
     try:
-        client = get_clob_client()
-        positions = client.get_positions()
-        return positions if isinstance(positions, list) else []
-    except Exception as e:
-        logger.warning("Failed to query positions: %s", e)
+        from utils.polymarket_connectivity import create_requests_session, install_dns_patch
+
+        install_dns_patch()
+        resp = create_requests_session().get(
+            f"{DATA_API_BASE}/positions",
+            params={"user": addr},
+            timeout=20,
+        )
+        if not resp.ok:
+            return []
+        payload = resp.json()
+        return payload if isinstance(payload, list) else []
+    except Exception as exc:
+        logger.warning("Failed to query positions: %s", exc)
         return []

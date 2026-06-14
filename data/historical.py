@@ -36,6 +36,45 @@ class HistoricalCandle:
     close_time: int      # Unix ms
 
 
+def fetch_recent_candles(
+    asset: str,
+    limit: int = 60,
+    interval: str = "1m",
+) -> list[HistoricalCandle]:
+    """
+    Fetch the most recent closed candles (public REST, no API key).
+
+    Used to seed the live websocket candle buffer so ATR/regime works
+    immediately on startup instead of waiting for ~10 closed 1m bars.
+    """
+    symbol = BINANCE_SYMBOLS.get(asset)
+    if not symbol:
+        raise ValueError(f"Unknown asset: {asset}")
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "limit": min(limit, MAX_CANDLES_PER_REQUEST),
+    }
+
+    resp = requests.get(BINANCE_KLINES_URL, params=params, timeout=10)
+    resp.raise_for_status()
+    raw_candles = resp.json()
+
+    return [
+        HistoricalCandle(
+            open_time=k[0],
+            open=float(k[1]),
+            high=float(k[2]),
+            low=float(k[3]),
+            close=float(k[4]),
+            volume=float(k[5]),
+            close_time=k[6],
+        )
+        for k in raw_candles
+    ]
+
+
 def fetch_candles(
     asset: str,
     days: int = 30,

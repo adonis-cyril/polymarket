@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { TrackedWallet } from "@/lib/types";
+
+const POLL_MS = 8000;
 
 export default function WhaleActivity() {
   const [wallets, setWallets] = useState<TrackedWallet[]>([]);
@@ -10,17 +11,11 @@ export default function WhaleActivity() {
 
   useEffect(() => {
     async function load() {
-      const [{ data: walletsData }, { data: trades }] = await Promise.all([
-        supabase
-          .from("tracked_wallets")
-          .select("*")
-          .eq("is_active", true)
-          .order("win_rate", { ascending: false })
-          .limit(10),
-        supabase.from("trades").select("whale_aligned").limit(200),
-      ]);
+      const res = await fetch("/api/whales");
+      if (!res.ok) return;
 
-      if (walletsData) setWallets(walletsData as TrackedWallet[]);
+      const { wallets: walletsData, trades } = await res.json();
+      if (walletsData) setWallets(walletsData);
 
       if (trades && trades.length > 0) {
         const aligned = trades.filter((t: { whale_aligned: boolean }) => t.whale_aligned).length;
@@ -29,6 +24,8 @@ export default function WhaleActivity() {
     }
 
     load();
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   return (
@@ -60,12 +57,12 @@ export default function WhaleActivity() {
                   {w.total_trades ?? 0} trades
                 </span>
                 <span className="font-mono font-bold">
-                  {((w.win_rate ?? 0) * 100).toFixed(0)}%
+                  {((Number(w.win_rate) ?? 0) * 100).toFixed(0)}%
                 </span>
                 <span
-                  className={`font-mono ${(w.total_pnl ?? 0) >= 0 ? "text-win" : "text-loss"}`}
+                  className={`font-mono ${(Number(w.total_pnl) ?? 0) >= 0 ? "text-win" : "text-loss"}`}
                 >
-                  ${(w.total_pnl ?? 0).toFixed(0)}
+                  ${(Number(w.total_pnl) ?? 0).toFixed(0)}
                 </span>
               </div>
             </div>

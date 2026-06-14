@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { BotState, Trade } from "@/lib/types";
 
 interface Stats {
@@ -37,75 +36,66 @@ const EXIT_COLORS: Record<string, string> = {
   RESOLUTION_LOSS: "bg-red-700",
 };
 
+const POLL_MS = 4000;
+
 export default function StatsGrid() {
   const [stats, setStats] = useState<Stats | null>(null);
 
   useEffect(() => {
     async function load() {
-      const [{ data: state }, { data: trades }] = await Promise.all([
-        supabase.from("bot_state").select("*").eq("id", 1).single(),
-        supabase.from("trades").select("*").order("timestamp", { ascending: false }).limit(500),
+      const [stateRes, tradesRes] = await Promise.all([
+        fetch("/api/bot-state"),
+        fetch("/api/trades?limit=500"),
       ]);
+      if (!stateRes.ok || !tradesRes.ok) return;
 
-      if (!state || !trades) return;
+      const state = (await stateRes.json()) as BotState;
+      const allTrades = (await tradesRes.json()) as Trade[];
+      if (!state) return;
 
-      const s = state as BotState;
-      const allTrades = trades as Trade[];
-
-      // 10% target hit rate
       const targetHits = allTrades.filter(
         (t) =>
           t.exit_reason === "TAKE_PROFIT_10PCT" ||
           t.exit_reason === "RESOLUTION_WIN" ||
-          (t.return_pct !== null && t.return_pct >= 10)
+          (t.return_pct !== null && Number(t.return_pct) >= 10)
       );
       const targetHitRate = allTrades.length > 0
         ? `${((targetHits.length / allTrades.length) * 100).toFixed(1)}%`
         : "N/A";
 
-      // Avg net return (after fees)
-      const withNet = allTrades.filter((t) => t.net_profit_after_fees !== null);
-      const avgNet = withNet.length > 0
-        ? withNet.reduce((s, t) => s + (t.net_profit_after_fees ?? 0), 0) / withNet.length
-        : 0;
-      // Express as % of bet
-      const withBet = allTrades.filter((t) => t.bet_size > 0 && t.net_profit_after_fees !== null);
+      const withBet = allTrades.filter((t) => Number(t.bet_size) > 0 && t.net_profit_after_fees !== null);
       const avgNetPct = withBet.length > 0
-        ? withBet.reduce((s, t) => s + ((t.net_profit_after_fees ?? 0) / t.bet_size) * 100, 0) / withBet.length
+        ? withBet.reduce((s, t) => s + ((Number(t.net_profit_after_fees) ?? 0) / Number(t.bet_size)) * 100, 0) / withBet.length
         : 0;
 
-      // Avg hold duration
-      const withHold = allTrades.filter((t) => t.hold_duration_seconds !== null && t.hold_duration_seconds > 0);
+      const withHold = allTrades.filter((t) => t.hold_duration_seconds !== null && Number(t.hold_duration_seconds) > 0);
       const avgHoldSecs = withHold.length > 0
-        ? withHold.reduce((s, t) => s + (t.hold_duration_seconds ?? 0), 0) / withHold.length
+        ? withHold.reduce((s, t) => s + (Number(t.hold_duration_seconds) ?? 0), 0) / withHold.length
         : 0;
 
-      // Exit breakdown
       const exitBreakdown: Record<string, number> = {};
       for (const t of allTrades) {
         const reason = t.exit_reason ?? "UNKNOWN";
         exitBreakdown[reason] = (exitBreakdown[reason] ?? 0) + 1;
       }
 
-      // Re-entries per window
-      const maxEntries = allTrades.reduce((m, t) => Math.max(m, t.num_entries_this_window ?? 1), 1);
       const multiEntryWindows = allTrades.filter((t) => (t.num_entries_this_window ?? 1) > 1).length;
 
-      // Fee info
       const latestFee = allTrades.find((t) => t.fee_rate !== null);
-      const feeRate = latestFee?.fee_rate ?? 0;
+      const feeRate = Number(latestFee?.fee_rate ?? 0);
       const roundTripPct = feeRate * 2 * 100;
 
-      // Best trade (by net profit)
-      const sorted = [...allTrades].sort((a, b) => (b.net_profit_after_fees ?? b.pnl ?? 0) - (a.net_profit_after_fees ?? a.pnl ?? 0));
+      const sorted = [...allTrades].sort(
+        (a, b) => (Number(b.net_profit_after_fees ?? b.pnl ?? 0)) - (Number(a.net_profit_after_fees ?? a.pnl ?? 0))
+      );
       const best = sorted[0];
       const bestStr = best
-        ? `+$${(best.net_profit_after_fees ?? best.pnl ?? 0).toFixed(2)} (${best.asset.toUpperCase()})`
+        ? `+$${(Number(best.net_profit_after_fees ?? best.pnl ?? 0)).toFixed(2)} (${best.asset.toUpperCase()})`
         : "N/A";
 
       setStats({
-        winRate: `${((s.win_rate ?? 0) * 100).toFixed(1)}%`,
-        totalTrades: s.total_trades,
+        winRate: `${((state.win_rate ?? 0) * 100).toFixed(1)}%`,
+        totalTrades: state.total_trades,
         targetHitRate,
         avgNetReturn: avgNetPct !== 0 ? `${avgNetPct.toFixed(1)}%` : "N/A",
         avgHoldDuration: avgHoldSecs > 0 ? `${Math.round(avgHoldSecs)}s` : "N/A",
@@ -118,14 +108,8 @@ export default function StatsGrid() {
     }
 
     load();
-
-    const channel = supabase
-      .channel("stats_updates")
-      .on("postgres_changes", { event: "*", schema: "public", table: "bot_state" }, () => load())
-      .on("postgres_changes", { event: "INSERT", schema: "public", table: "trades" }, () => load())
-      .subscribe();
-
-    return () => { supabase.removeChannel(channel); };
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   if (!stats) {
@@ -145,7 +129,6 @@ export default function StatsGrid() {
 
   return (
     <div className="space-y-4">
-      {/* Main stats */}
       <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
         {[
           { label: "Win Rate", value: stats.winRate, sub: `${stats.totalTrades} total trades` },
@@ -169,7 +152,6 @@ export default function StatsGrid() {
         ))}
       </div>
 
-      {/* Exit reason breakdown bar */}
       {totalExits > 0 && (
         <div className="bg-card-bg border border-card-border rounded-xl p-4">
           <div className="text-xs text-muted uppercase tracking-wide mb-3">Exit Breakdown</div>

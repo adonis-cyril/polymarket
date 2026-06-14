@@ -45,6 +45,13 @@ class OrderResult:
 
 
 _client: Optional[ClobClient] = None
+_v2_client = None
+MIN_SHARES = 5.0
+
+
+def _uses_deposit_wallet() -> bool:
+    """POLY_1271 deposit-wallet flow requires py-clob-client-v2."""
+    return POLY_SIGNATURE_TYPE == 3
 
 
 def get_clob_client() -> ClobClient:
@@ -53,6 +60,10 @@ def get_clob_client() -> ClobClient:
     if _client is None:
         if not POLY_PRIVATE_KEY:
             raise RuntimeError("POLY_PRIVATE_KEY not set")
+
+        # py-clob-client uses raw requests; bypass ISP DNS hijacks first
+        from utils.polymarket_connectivity import install_dns_patch
+        install_dns_patch()
 
         _client = ClobClient(
             POLY_CLOB_URL,
@@ -68,6 +79,63 @@ def get_clob_client() -> ClobClient:
         logger.info("CLOB client initialized for %s", POLY_FUNDER_ADDRESS[:10])
 
     return _client
+
+
+def _get_v2_client():
+    """CLOB client for deposit-wallet (signature_type=3) accounts."""
+    global _v2_client
+    if _v2_client is None:
+        from py_clob_client_v2.client import ClobClient as ClobClientV2
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
+
+        v1 = get_clob_client()
+        _v2_client = ClobClientV2(
+            POLY_CLOB_URL,
+            chain_id=POLY_CHAIN_ID,
+            key=POLY_PRIVATE_KEY,
+            signature_type=POLY_SIGNATURE_TYPE,
+            funder=POLY_FUNDER_ADDRESS,
+            creds=v1.creds,
+        )
+        try:
+            _v2_client.update_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL),
+            )
+        except Exception as exc:
+            logger.warning("Deposit-wallet allowance sync failed: %s", exc)
+        logger.info("CLOB v2 client initialized for deposit wallet %s", POLY_FUNDER_ADDRESS[:10])
+    return _v2_client
+
+
+def compute_buy_shares(amount_usdc: float, best_ask: float) -> float:
+    """
+    Size a buy to stay within ``amount_usdc``.
+
+    Polymarket requires at least MIN_SHARES. If the minimum would exceed the
+    budget at the current ask, raises ValueError instead of oversizing.
+    """
+    price = round(best_ask, 2)
+    if price <= 0:
+        raise ValueError(f"Invalid ask price: {best_ask}")
+
+    shares = round(amount_usdc / price, 2)
+    if shares < MIN_SHARES:
+        min_notional = round(MIN_SHARES * price, 2)
+        if min_notional > amount_usdc:
+            raise ValueError(
+                f"Cannot buy within ${amount_usdc:.2f}: Polymarket minimum is "
+                f"{MIN_SHARES:.0f} shares, which costs ${min_notional:.2f} at "
+                f"${price:.2f} ask"
+            )
+        shares = MIN_SHARES
+
+    notional = round(shares * price, 2)
+    if notional > amount_usdc:
+        raise ValueError(
+            f"Order notional ${notional:.2f} exceeds ${amount_usdc:.2f} budget "
+            f"({shares:.2f} shares @ ${price:.2f})"
+        )
+    return shares
 
 
 def get_fee_rate() -> float:
@@ -95,12 +163,21 @@ def place_buy_order(
     2. Wait MAKER_WAIT_SECONDS for fill
     3. If unfilled, cancel and send FAK at best_ask
     """
+    try:
+        max_shares = compute_buy_shares(amount_usdc, best_ask)
+    except ValueError as exc:
+        logger.error("Buy rejected: %s", exc)
+        return OrderResult(success=False, error=str(exc))
+
+    if _uses_deposit_wallet():
+        return _place_buy_order_v2(token_id, amount_usdc, best_ask, max_shares)
+
     client = get_clob_client()
 
-    # Calculate shares
+    # Calculate shares (cap at budget-validated size)
     maker_price = round(best_ask - MAKER_PRICE_OFFSET, 2)
     maker_price = max(maker_price, 0.01)
-    shares = amount_usdc / maker_price
+    shares = min(amount_usdc / maker_price, max_shares)
 
     logger.info(
         "BUY: posting maker limit at $%.2f for %.1f shares ($%.2f)",
@@ -146,7 +223,7 @@ def place_buy_order(
     # Step 3: FAK market order at best_ask
     logger.info("Falling back to FAK at $%.2f", best_ask)
     try:
-        taker_shares = amount_usdc / best_ask
+        taker_shares = max_shares
         order_args = OrderArgs(
             price=best_ask,
             size=round(taker_shares, 2),
@@ -182,6 +259,9 @@ def place_sell_order(
     If urgent (stop loss, time stop): FAK market sell immediately.
     If not urgent (take profit): GTC limit sell at target price.
     """
+    if _uses_deposit_wallet():
+        return _place_sell_order_v2(token_id, shares, target_price, urgent)
+
     client = get_clob_client()
 
     if urgent:
@@ -255,6 +335,85 @@ def place_sell_order(
         except Exception as e:
             logger.error("Sell order failed: %s", e)
             return OrderResult(success=False, error=str(e))
+
+
+def _place_buy_order_v2(
+    token_id: str,
+    amount_usdc: float,
+    best_ask: float,
+    shares: float,
+) -> OrderResult:
+    """Deposit-wallet buy: FAK limit at best ask (min 5 shares)."""
+    from py_clob_client_v2.clob_types import OrderArgsV2, OrderType as OrderTypeV2
+
+    client = _get_v2_client()
+    price = round(best_ask, 2)
+    notional = round(shares * price, 2)
+
+    logger.info(
+        "BUY (v2): FAK %.2f shares @ $%.2f (~$%.2f, requested $%.2f)",
+        shares, price, notional, amount_usdc,
+    )
+
+    try:
+        order_args = OrderArgsV2(
+            price=price,
+            size=shares,
+            side="BUY",
+            token_id=token_id,
+        )
+        signed_order = client.create_order(order_args)
+        response = client.post_order(signed_order, OrderTypeV2.FAK)
+        order_id = response.get("orderID", response.get("id", ""))
+        return OrderResult(
+            success=True,
+            order_id=order_id,
+            fill_price=price,
+            fill_size=shares,
+            execution_type="TAKER",
+        )
+    except Exception as exc:
+        logger.error("v2 buy failed: %s", exc)
+        return OrderResult(success=False, error=str(exc))
+
+
+def _place_sell_order_v2(
+    token_id: str,
+    shares: float,
+    target_price: float,
+    urgent: bool,
+) -> OrderResult:
+    """Deposit-wallet sell."""
+    from py_clob_client_v2.clob_types import OrderArgsV2, OrderType as OrderTypeV2
+
+    client = _get_v2_client()
+    price = round(target_price, 2)
+    size = round(shares, 4)
+    order_type = OrderTypeV2.FAK if urgent else OrderTypeV2.GTC
+    label = "URGENT SELL" if urgent else "SELL"
+
+    logger.info("%s (v2): %s %.2f shares @ $%.2f", label, order_type, size, price)
+
+    try:
+        order_args = OrderArgsV2(
+            price=price,
+            size=size,
+            side="SELL",
+            token_id=token_id,
+        )
+        signed_order = client.create_order(order_args)
+        response = client.post_order(signed_order, order_type)
+        order_id = response.get("orderID", response.get("id", ""))
+        return OrderResult(
+            success=True,
+            order_id=order_id,
+            fill_price=price,
+            fill_size=size,
+            execution_type="TAKER" if urgent else "MAKER",
+        )
+    except Exception as exc:
+        logger.error("v2 sell failed: %s", exc)
+        return OrderResult(success=False, error=str(exc))
 
 
 def cancel_all_orders():

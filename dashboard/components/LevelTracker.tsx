@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { Level, BotState } from "@/lib/types";
 
 const TARGETS = [40, 80, 160, 320, 640, 1280, 2560, 5120, 10240];
+const POLL_MS = 4000;
 
 export default function LevelTracker() {
   const [levels, setLevels] = useState<Level[]>([]);
@@ -12,42 +12,24 @@ export default function LevelTracker() {
   const [currentLevel, setCurrentLevel] = useState(1);
 
   useEffect(() => {
-    supabase
-      .from("levels")
-      .select("*")
-      .order("level", { ascending: true })
-      .then(({ data }) => {
-        if (data) setLevels(data as Level[]);
-      });
-
-    supabase
-      .from("bot_state")
-      .select("current_balance, current_level")
-      .eq("id", 1)
-      .single()
-      .then(({ data }) => {
+    async function load() {
+      const [levelsRes, stateRes] = await Promise.all([
+        fetch("/api/levels"),
+        fetch("/api/bot-state"),
+      ]);
+      if (levelsRes.ok) setLevels(await levelsRes.json());
+      if (stateRes.ok) {
+        const data = (await stateRes.json()) as BotState;
         if (data) {
-          setCurrentBalance(data.current_balance ?? 20);
+          setCurrentBalance(Number(data.current_balance ?? 20));
           setCurrentLevel(data.current_level ?? 1);
         }
-      });
+      }
+    }
 
-    const channel = supabase
-      .channel("level_tracker")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "bot_state" },
-        (payload) => {
-          const s = payload.new as BotState;
-          setCurrentBalance(s.current_balance ?? 20);
-          setCurrentLevel(s.current_level ?? 1);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    load();
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   return (
@@ -105,7 +87,7 @@ export default function LevelTracker() {
               {reached && (
                 <div className="text-[9px] text-muted text-center">
                   {reached.time_elapsed_hours
-                    ? `${reached.time_elapsed_hours.toFixed(0)}h`
+                    ? `${Number(reached.time_elapsed_hours).toFixed(0)}h`
                     : ""}
                 </div>
               )}

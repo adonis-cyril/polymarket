@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { Trade } from "@/lib/types";
 
 const ASSET_COLORS: Record<string, string> = {
@@ -11,33 +10,20 @@ const ASSET_COLORS: Record<string, string> = {
   xrp: "text-gray-300",
 };
 
+const POLL_MS = 4000;
+
 export default function RecentTrades() {
   const [trades, setTrades] = useState<Trade[]>([]);
 
   useEffect(() => {
-    supabase
-      .from("trades")
-      .select("*")
-      .order("timestamp", { ascending: false })
-      .limit(50)
-      .then(({ data }) => {
-        if (data) setTrades(data as Trade[]);
-      });
+    async function load() {
+      const res = await fetch("/api/trades?limit=50");
+      if (res.ok) setTrades(await res.json());
+    }
 
-    const channel = supabase
-      .channel("recent_trades")
-      .on(
-        "postgres_changes",
-        { event: "INSERT", schema: "public", table: "trades" },
-        (payload) => {
-          setTrades((prev) => [payload.new as Trade, ...prev].slice(0, 50));
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    load();
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   return (
@@ -88,10 +74,10 @@ export default function RecentTrades() {
                   </span>
                 </td>
                 <td className="py-2 pr-3 text-right font-mono">
-                  ${trade.token_price.toFixed(2)}
+                  ${Number(trade.token_price).toFixed(2)}
                 </td>
                 <td className="py-2 pr-3 text-right font-mono">
-                  ${trade.bet_size.toFixed(2)}
+                  ${Number(trade.bet_size).toFixed(2)}
                 </td>
                 <td className="py-2 pr-3 text-center">
                   <div className="flex items-center justify-center gap-1 flex-wrap">
@@ -141,15 +127,15 @@ export default function RecentTrades() {
                   }`}
                 >
                   {(trade.net_profit_after_fees ?? trade.pnl ?? 0) >= 0 ? "+" : ""}$
-                  {Math.abs(trade.net_profit_after_fees ?? trade.pnl ?? 0).toFixed(2)}
+                  {Math.abs(Number(trade.net_profit_after_fees ?? trade.pnl ?? 0)).toFixed(2)}
                   {trade.fees_paid ? (
                     <span className="text-muted text-[9px] block">
-                      -${trade.fees_paid.toFixed(2)} fee
+                      -${Number(trade.fees_paid).toFixed(2)} fee
                     </span>
                   ) : null}
                 </td>
                 <td className="py-2 text-right font-mono">
-                  ${trade.balance_after.toFixed(2)}
+                  ${Number(trade.balance_after).toFixed(2)}
                 </td>
               </tr>
             ))}

@@ -3,6 +3,8 @@
 import logging
 import sys
 
+from utils.realtime_log import init_realtime_logging
+
 
 def setup_logging(level: str = "INFO"):
     """Configure structured logging to stdout."""
@@ -25,3 +27,5 @@ def setup_logging(level: str = "INFO"):
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    init_realtime_logging()

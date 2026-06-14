@@ -22,7 +22,7 @@ from typing import Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from config import ASSETS, BINANCE_SYMBOLS, BINANCE_WS_URL, CANDLE_BUFFER_SIZE, PRICE_HISTORY_SECONDS
+from config import ASSETS, BINANCE_SYMBOLS, BINANCE_WS_BASE, CANDLE_BUFFER_SIZE, PRICE_HISTORY_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,7 @@ class BinanceWebsocket:
         if self._running:
             return
         self._running = True
+        await asyncio.to_thread(self._seed_candles_from_rest)
         self._task = asyncio.create_task(self._run_forever())
         # Wait for initial connection (up to 10 seconds)
         try:
@@ -164,14 +165,48 @@ class BinanceWebsocket:
     # ----- Internal websocket management -----
 
     def _build_stream_url(self) -> str:
-        """Build the combined streams URL for all assets."""
+        """Build Binance stream URL (single raw or combined multi-stream)."""
         streams = []
         for asset in ASSETS:
             symbol = BINANCE_SYMBOLS[asset].lower()
             streams.append(f"{symbol}@miniTicker")
             streams.append(f"{symbol}@kline_1m")
+        if len(streams) == 1:
+            return f"{BINANCE_WS_BASE}/ws/{streams[0]}"
         stream_path = "/".join(streams)
-        return f"{BINANCE_WS_URL}/{stream_path}"
+        return f"{BINANCE_WS_BASE}/stream?streams={stream_path}"
+
+    def _seed_candles_from_rest(self):
+        """Pre-load recent closed 1m candles so regime ATR is warm on startup."""
+        from data.historical import fetch_recent_candles
+
+        for asset in ASSETS:
+            try:
+                historical = fetch_recent_candles(asset, limit=CANDLE_BUFFER_SIZE)
+            except Exception:
+                logger.exception("Failed to seed REST candles for %s", asset)
+                continue
+
+            candles = self._data[asset].candles
+            for h in historical:
+                candles.append(
+                    Candle(
+                        open_time=h.open_time,
+                        open=h.open,
+                        high=h.high,
+                        low=h.low,
+                        close=h.close,
+                        volume=h.volume,
+                        close_time=h.close_time,
+                        is_closed=True,
+                    )
+                )
+            if historical:
+                logger.info(
+                    "Seeded %d closed 1m candles for %s from Binance REST",
+                    len(historical),
+                    asset.upper(),
+                )
 
     async def _run_forever(self):
         """Main loop: connect, receive messages, reconnect on failure."""
@@ -207,6 +242,10 @@ class BinanceWebsocket:
 
     def _handle_message(self, msg: dict):
         """Route incoming message to the appropriate handler."""
+        # Combined streams wrap payloads: {"stream": "...", "data": {...}}
+        if "data" in msg and "stream" in msg:
+            msg = msg["data"]
+
         event_type = msg.get("e")
 
         if event_type == "24hrMiniTicker":

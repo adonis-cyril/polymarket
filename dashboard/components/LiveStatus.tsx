@@ -1,7 +1,6 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { supabase } from "@/lib/supabase";
 import type { BotState } from "@/lib/types";
 
 const STATUS_COLORS: Record<string, string> = {
@@ -11,43 +10,20 @@ const STATUS_COLORS: Record<string, string> = {
   BLOWN_UP: "bg-red-500",
 };
 
-const STATUS_EMOJI: Record<string, string> = {
-  RUNNING: "",
-  PAUSED: "",
-  STOPPED: "",
-  BLOWN_UP: "",
-};
+const POLL_MS = 4000;
 
 export default function LiveStatus() {
   const [state, setState] = useState<BotState | null>(null);
-  const [startTime] = useState(Date.now());
 
   useEffect(() => {
-    // Initial fetch
-    supabase
-      .from("bot_state")
-      .select("*")
-      .eq("id", 1)
-      .single()
-      .then(({ data }) => {
-        if (data) setState(data as BotState);
-      });
+    async function load() {
+      const res = await fetch("/api/bot-state");
+      if (res.ok) setState(await res.json());
+    }
 
-    // Real-time subscription
-    const channel = supabase
-      .channel("bot_state_changes")
-      .on(
-        "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "bot_state" },
-        (payload) => {
-          setState(payload.new as BotState);
-        }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
+    load();
+    const interval = setInterval(load, POLL_MS);
+    return () => clearInterval(interval);
   }, []);
 
   if (!state) {
